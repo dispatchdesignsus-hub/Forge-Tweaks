@@ -1,0 +1,1998 @@
+# Forge Tweaks - Windows optimization suite
+# Host: Windows PowerShell 5.1, STA (powershell.exe is STA by default)
+# Run:  powershell -NoProfile -ExecutionPolicy Bypass -STA -File .\ForgeTweaks.ps1
+#
+# Save and review this file before running it. Do not pipe a remote script
+# straight into iex, and especially not as administrator.
+#
+# Every change is backed up first to:
+#   %LOCALAPPDATA%\ForgeTune\Ember-Rebuild\originals.json
+# (that folder name is kept so existing ForgeTune backups keep working)
+#
+# Nothing is changed automatically; every change requires a click + confirm.
+
+$ErrorActionPreference = 'Stop'
+
+$script:FTVersion = '1.1.0'
+$script:FTProduct = 'Forge Tweaks'
+
+try {
+    if ($env:OS -ne 'Windows_NT') { throw 'Forge Tweaks requires Windows.' }
+    if ($PSVersionTable.PSVersion -lt [version]'5.1') { throw 'Forge Tweaks requires Windows PowerShell 5.1.' }
+    if ($PSVersionTable.PSEdition -ne 'Desktop') { throw 'Run Forge Tweaks in Windows PowerShell 5.1 (powershell.exe), not PowerShell 7.' }
+    if ([Threading.Thread]::CurrentThread.GetApartmentState() -ne [Threading.ApartmentState]::STA) {
+        throw 'Forge Tweaks must run in STA mode. Start powershell.exe with the -STA switch.'
+    }
+
+    Add-Type -AssemblyName PresentationFramework
+    Add-Type -AssemblyName PresentationCore
+    Add-Type -AssemblyName WindowsBase
+    Add-Type -AssemblyName System.Drawing
+
+    $script:FT = @{
+        Window      = $null
+        UI          = @{}
+        Busy        = $false
+        ImagePath   = ''
+        BackupReady = $false
+        BackupError = ''
+        IsAdmin     = $false
+        AppliedCount = 0
+        ActivePlanLabel = '-'
+        HardwareSummary = ''
+        Data        = Join-Path $env:LOCALAPPDATA 'ForgeTune\Ember-Rebuild'
+        Backup      = [pscustomobject]@{
+            Version        = 2
+            Power          = ''
+            Plans          = @()
+            WallpaperSaved = $false
+            Wallpaper      = ''
+            Tweaks         = [pscustomobject]@{}
+        }
+    }
+    $script:FT.BackupFile   = Join-Path $script:FT.Data 'originals.json'
+    $script:FT.SettingsFile = Join-Path $script:FT.Data 'settings.json'
+    $script:FT.ChangelogFile = Join-Path $script:FT.Data 'changelog.json'
+    $script:GuidPattern = '[0-9a-fA-F]{8}-(?:[0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12}'
+
+    $script:FT.IsAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()
+        ).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+
+    # ------------------------------------------------------------- themes
+    $script:Themes = @{
+        'Forge Purple' = @{
+            Bg = '#0D0D10'; Panel = '#121216'; Card = '#17171C'
+            Line = '#26262E'; Muted = '#8A8A96'; Text = '#E8E8EE'
+        }
+        'Midnight Black' = @{
+            Bg = '#07070A'; Panel = '#0B0B0F'; Card = '#101015'
+            Line = '#1E1E26'; Muted = '#7E7E8A'; Text = '#E6E6EC'
+        }
+        'Dark Gray' = @{
+            Bg = '#16161A'; Panel = '#1C1C22'; Card = '#22222A'
+            Line = '#30303A'; Muted = '#9A9AA6'; Text = '#ECECF2'
+        }
+    }
+    $script:Accents = @('#8B5CF6', '#A855F7', '#6366F1', '#7C3AED')
+
+    $script:FT.Settings = [pscustomobject]@{
+        Version             = 1
+        ThemePreset         = 'Forge Purple'
+        AccentColor         = '#8B5CF6'
+        StartPage           = 'Dashboard'
+        ShowWhatsNewOnUpdate = $true
+        RememberWindow      = $true
+        LastSeenVersion     = ''
+        WindowSaved         = $false
+        WindowLeft          = 0
+        WindowTop           = 0
+        WindowWidth         = 1180
+        WindowHeight        = 740
+    }
+
+    if (-not ('ForgeTweaks.Native' -as [type])) {
+        Add-Type -TypeDefinition @'
+using System;
+using System.Text;
+using System.Runtime.InteropServices;
+
+namespace ForgeTweaks {
+    public static class Native {
+        [DllImport("user32.dll", EntryPoint="SystemParametersInfoW", CharSet=CharSet.Unicode, SetLastError=true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        public static extern bool ReadWallpaper(uint action, uint size, StringBuilder value, uint flags);
+
+        [DllImport("user32.dll", EntryPoint="SystemParametersInfoW", CharSet=CharSet.Unicode, SetLastError=true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        public static extern bool WriteWallpaper(uint action, uint size, string value, uint flags);
+    }
+
+    public class Row : System.ComponentModel.INotifyPropertyChanged {
+        private bool _selected;
+        public string Id { get; set; }
+        public string Name { get; set; }
+        public string Category { get; set; }
+        public string Status { get; set; }
+        public string Detail { get; set; }
+        public bool Selected {
+            get { return _selected; }
+            set { _selected = value; OnChanged("Selected"); }
+        }
+        public event System.ComponentModel.PropertyChangedEventHandler PropertyChanged;
+        private void OnChanged(string n) {
+            var h = PropertyChanged;
+            if (h != null) h(this, new System.ComponentModel.PropertyChangedEventArgs(n));
+        }
+    }
+}
+'@
+    }
+
+    # ------------------------------------------------------------------ tweaks
+    # Each tweak lists the registry values it writes. Originals are captured
+    # per tweak before the first write and restored on revert.
+    $script:Tweaks = @(
+        @{ Id='gamedvr';   Cat='Gaming';  Admin=$false; Name='Disable Game DVR / background recording'
+           Desc='Stops Xbox Game DVR capturing gameplay in the background.'
+           Values=@(
+             @{P='HKCU\System\GameConfigStore'; N='GameDVR_Enabled'; K='DWord'; D=0},
+             @{P='HKCU\Software\Microsoft\Windows\CurrentVersion\GameDVR'; N='AppCaptureEnabled'; K='DWord'; D=0}) }
+        @{ Id='gamemode';  Cat='Gaming';  Admin=$false; Name='Enable Windows Game Mode'
+           Desc='Prioritizes game processes while a game is in the foreground.'
+           Values=@(@{P='HKCU\Software\Microsoft\GameBar'; N='AutoGameModeEnabled'; K='DWord'; D=1}) }
+        @{ Id='gamebar';   Cat='Gaming';  Admin=$false; Name='Disable Game Bar popups'
+           Desc='Turns off Game Bar startup panel and controller-button launch.'
+           Values=@(
+             @{P='HKCU\Software\Microsoft\GameBar'; N='ShowStartupPanel'; K='DWord'; D=0},
+             @{P='HKCU\Software\Microsoft\GameBar'; N='UseNexusForGameBarEnabled'; K='DWord'; D=0}) }
+        @{ Id='mouseaccel'; Cat='Gaming'; Admin=$false; Name='Disable mouse acceleration'
+           Desc='Turns off Enhance Pointer Precision for raw 1:1 mouse input.'
+           Values=@(
+             @{P='HKCU\Control Panel\Mouse'; N='MouseSpeed'; K='String'; D='0'},
+             @{P='HKCU\Control Panel\Mouse'; N='MouseThreshold1'; K='String'; D='0'},
+             @{P='HKCU\Control Panel\Mouse'; N='MouseThreshold2'; K='String'; D='0'}) }
+        @{ Id='sticky';    Cat='Gaming';  Admin=$false; Name='Disable Sticky / Filter key prompts'
+           Desc='Stops accessibility popups when tapping Shift repeatedly.'
+           Values=@(
+             @{P='HKCU\Control Panel\Accessibility\StickyKeys'; N='Flags'; K='String'; D='506'},
+             @{P='HKCU\Control Panel\Accessibility\ToggleKeys'; N='Flags'; K='String'; D='58'},
+             @{P='HKCU\Control Panel\Accessibility\Keyboard Response'; N='Flags'; K='String'; D='122'}) }
+        @{ Id='gpupri';    Cat='Gaming';  Admin=$true;  Name='Games scheduling priority (High)'
+           Desc='Raises GPU/CPU priority for the Games multimedia task profile.'
+           Values=@(
+             @{P='HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile\Tasks\Games'; N='GPU Priority'; K='DWord'; D=8},
+             @{P='HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile\Tasks\Games'; N='Priority'; K='DWord'; D=6},
+             @{P='HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile\Tasks\Games'; N='Scheduling Category'; K='String'; D='High'},
+             @{P='HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile\Tasks\Games'; N='SFIO Priority'; K='String'; D='High'}) }
+        @{ Id='hags';      Cat='Gaming';  Admin=$true;  Name='Enable Hardware-accelerated GPU scheduling'
+           Desc='Lets the GPU manage its own VRAM scheduling (requires reboot).'
+           Values=@(@{P='HKLM\SYSTEM\CurrentControlSet\Control\GraphicsDrivers'; N='HwSchMode'; K='DWord'; D=2}) }
+        @{ Id='throttle';  Cat='System';  Admin=$true;  Name='Disable power throttling'
+           Desc='Prevents Windows from throttling background CPU work.'
+           Values=@(@{P='HKLM\SYSTEM\CurrentControlSet\Control\Power\PowerThrottling'; N='PowerThrottlingOff'; K='DWord'; D=1}) }
+        @{ Id='respons';   Cat='System';  Admin=$true;  Name='System responsiveness 10%'
+           Desc='Reserves less CPU for background tasks during multimedia.'
+           Values=@(@{P='HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile'; N='SystemResponsiveness'; K='DWord'; D=10}) }
+        @{ Id='transp';    Cat='System';  Admin=$false; Name='Disable transparency effects'
+           Desc='Removes blur/acrylic for a lighter desktop composition load.'
+           Values=@(@{P='HKCU\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize'; N='EnableTransparency'; K='DWord'; D=0}) }
+        @{ Id='anim';      Cat='System';  Admin=$false; Name='Disable window animations'
+           Desc='Turns off minimize/maximize animations.'
+           Values=@(@{P='HKCU\Control Panel\Desktop\WindowMetrics'; N='MinAnimate'; K='String'; D='0'}) }
+        @{ Id='bgapps';    Cat='System';  Admin=$false; Name='Disable background apps'
+           Desc='Stops Store apps running in the background.'
+           Values=@(@{P='HKCU\Software\Microsoft\Windows\CurrentVersion\BackgroundAccessApplications'; N='GlobalUserDisabled'; K='DWord'; D=1}) }
+        @{ Id='sugg';      Cat='Privacy'; Admin=$false; Name='Disable Start menu suggestions & tips'
+           Desc='Turns off suggested apps, tips, and silent app installs.'
+           Values=@(
+             @{P='HKCU\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager'; N='SystemPaneSuggestionsEnabled'; K='DWord'; D=0},
+             @{P='HKCU\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager'; N='SilentInstalledAppsEnabled'; K='DWord'; D=0},
+             @{P='HKCU\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager'; N='SubscribedContent-338389Enabled'; K='DWord'; D=0},
+             @{P='HKCU\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager'; N='SubscribedContent-338388Enabled'; K='DWord'; D=0}) }
+        @{ Id='adid';      Cat='Privacy'; Admin=$false; Name='Disable advertising ID'
+           Desc='Stops apps using your advertising identifier.'
+           Values=@(@{P='HKCU\Software\Microsoft\Windows\CurrentVersion\AdvertisingInfo'; N='Enabled'; K='DWord'; D=0}) }
+        @{ Id='telem';     Cat='Privacy'; Admin=$true;  Name='Minimize telemetry'
+           Desc='Sets diagnostic data to the lowest level your edition allows.'
+           Values=@(@{P='HKLM\SOFTWARE\Policies\Microsoft\Windows\DataCollection'; N='AllowTelemetry'; K='DWord'; D=0}) }
+        @{ Id='netthr';    Cat='Network'; Admin=$true;  Name='Disable network throttling'
+           Desc='Removes the multimedia network packet throttling limit.'
+           Values=@(@{P='HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile'; N='NetworkThrottlingIndex'; K='DWord'; D=-1}) }
+        @{ Id='dopt';      Cat='Network'; Admin=$true;  Name='Disable Delivery Optimization uploads'
+           Desc='Stops Windows Update sharing bandwidth with other PCs.'
+           Values=@(@{P='HKLM\SOFTWARE\Policies\Microsoft\Windows\DeliveryOptimization'; N='DODownloadMode'; K='DWord'; D=0}) }
+    )
+
+    # ---------------------------------------------------------------- helpers
+    function Write-FTLog {
+        param(
+            [string]$Message,
+            [ValidateSet('INFO', 'OK', 'WARN', 'ERROR')][string]$Level = 'INFO'
+        )
+        $line = '[{0}] {1,-5} {2}' -f (Get-Date -Format 'HH:mm:ss'), $Level, $Message
+        if ($script:FT.UI.ContainsKey('Log')) {
+            $script:FT.UI.Log.AppendText($line + "`r`n")
+            $script:FT.UI.Log.ScrollToEnd()
+        }
+    }
+
+    function Update-FTScreen {
+        if ($null -eq $script:FT.Window) { return }
+        try { $script:FT.Window.Dispatcher.Invoke([Action]{}, [Windows.Threading.DispatcherPriority]::Render) } catch {}
+    }
+
+    function Set-FTStatus { param([string]$Text) $script:FT.UI.Status.Text = $Text }
+
+    function Confirm-FT {
+        param([string]$Message, [string]$Title = 'Confirm')
+        $answer = [Windows.MessageBox]::Show($script:FT.Window, $Message,
+            "$script:FTProduct | $Title",
+            [Windows.MessageBoxButton]::YesNo, [Windows.MessageBoxImage]::Question)
+        return ($answer -eq [Windows.MessageBoxResult]::Yes)
+    }
+
+    function Invoke-FT {
+        param([scriptblock]$Action)
+        if ($script:FT.Busy) { return }
+        $script:FT.Busy = $true
+        $script:FT.UI.Body.IsEnabled = $false
+        $script:FT.UI.Nav.IsEnabled = $false
+        $script:FT.Window.Cursor = [Windows.Input.Cursors]::Wait
+        Set-FTStatus 'Working...'
+        Update-FTScreen
+        try {
+            & $Action | Out-Null
+            Set-FTStatus 'Ready'
+        }
+        catch {
+            $message = $_.Exception.Message
+            Write-FTLog $message 'ERROR'
+            Set-FTStatus 'Action failed'
+            [void][Windows.MessageBox]::Show($script:FT.Window, $message,
+                "$script:FTProduct | Action failed",
+                [Windows.MessageBoxButton]::OK, [Windows.MessageBoxImage]::Error)
+        }
+        finally {
+            $script:FT.Busy = $false
+            $script:FT.UI.Body.IsEnabled = $true
+            $script:FT.UI.Nav.IsEnabled = $true
+            $script:FT.Window.Cursor = [Windows.Input.Cursors]::Arrow
+            try { Update-FTBackupDisplay; Update-FTDashboard } catch { Write-FTLog $_.Exception.Message 'WARN' }
+        }
+    }
+
+    function Get-FTDataFolder {
+        if (-not $env:LOCALAPPDATA) { throw 'LOCALAPPDATA is not set; cannot locate the Forge Tweaks data folder.' }
+        $script:FT.Data = Join-Path $env:LOCALAPPDATA 'ForgeTune\Ember-Rebuild'
+        [void][IO.Directory]::CreateDirectory($script:FT.Data)
+        return $script:FT.Data
+    }
+
+    # ---------------------------------------------------------------- settings
+    function New-FTAlpha {
+        param([string]$Hex, [int]$Alpha)
+        return ('#{0:X2}{1}' -f $Alpha, $Hex.TrimStart('#'))
+    }
+
+    function Set-FTBrush {
+        param([string]$Key, [string]$Hex)
+        $brush = $script:FT.Window.Resources[$Key]
+        if ($null -eq $brush) { return }
+        try { $brush.Color = [Windows.Media.ColorConverter]::ConvertFromString($Hex) }
+        catch { Write-FTLog "Theme colour rejected: $Hex" 'WARN' }
+    }
+
+    function Apply-FTTheme {
+        $preset = [string]$script:FT.Settings.ThemePreset
+        if (-not $script:Themes.ContainsKey($preset)) { $preset = 'Forge Purple' }
+        $t = $script:Themes[$preset]
+        Set-FTBrush 'Bg'     $t.Bg
+        Set-FTBrush 'Panel'  $t.Panel
+        Set-FTBrush 'CardBg' $t.Card
+        Set-FTBrush 'Line'   $t.Line
+        Set-FTBrush 'Muted'  $t.Muted
+        Set-FTBrush 'Text'   $t.Text
+
+        $accent = [string]$script:FT.Settings.AccentColor
+        if ($accent -notmatch '^#[0-9a-fA-F]{6}$') { $accent = '#8B5CF6' }
+        Set-FTBrush 'Accent'      $accent
+        Set-FTBrush 'AccentSoft'  (New-FTAlpha $accent 0x26)
+        Set-FTBrush 'AccentRow'   (New-FTAlpha $accent 0x40)
+        Set-FTBrush 'AccentBadge' (New-FTAlpha $accent 0x2D)
+    }
+
+    function Initialize-FTSettings {
+        [void](Get-FTDataFolder)
+        if (-not [IO.File]::Exists($script:FT.SettingsFile)) { Save-FTSettings; return }
+        try {
+            $loaded = Get-Content -LiteralPath $script:FT.SettingsFile -Raw | ConvertFrom-Json
+            if ($null -eq $loaded -or $loaded.Version -ne 1) { throw 'Unsupported settings version.' }
+            $s = $script:FT.Settings
+            if ([string]$loaded.ThemePreset -and $script:Themes.ContainsKey([string]$loaded.ThemePreset)) { $s.ThemePreset = [string]$loaded.ThemePreset }
+            if ([string]$loaded.AccentColor -match '^#[0-9a-fA-F]{6}$') { $s.AccentColor = [string]$loaded.AccentColor }
+            if ([string]$loaded.StartPage) { $s.StartPage = [string]$loaded.StartPage }
+            $s.ShowWhatsNewOnUpdate = [bool]$loaded.ShowWhatsNewOnUpdate
+            $s.RememberWindow      = [bool]$loaded.RememberWindow
+            $s.LastSeenVersion     = [string]$loaded.LastSeenVersion
+            $s.WindowSaved         = [bool]$loaded.WindowSaved
+            if ($loaded.WindowWidth  -as [double]) { $s.WindowWidth  = [double]$loaded.WindowWidth }
+            if ($loaded.WindowHeight -as [double]) { $s.WindowHeight = [double]$loaded.WindowHeight }
+            if ($loaded.WindowLeft   -as [double]) { $s.WindowLeft   = [double]$loaded.WindowLeft }
+            if ($loaded.WindowTop    -as [double]) { $s.WindowTop    = [double]$loaded.WindowTop }
+        }
+        catch {
+            Write-FTLog "Settings file could not be read; using defaults. $($_.Exception.Message)" 'WARN'
+        }
+    }
+
+    function Save-FTSettings {
+        try {
+            [void](Get-FTDataFolder)
+            $temp = Join-Path $script:FT.Data ('settings-{0}.tmp' -f [guid]::NewGuid().ToString('N'))
+            try {
+                $json = ConvertTo-Json -InputObject $script:FT.Settings -Depth 4
+                [IO.File]::WriteAllText($temp, $json, [Text.UTF8Encoding]::new($true))
+                [IO.File]::Copy($temp, $script:FT.SettingsFile, $true)
+            }
+            finally { if ([IO.File]::Exists($temp)) { [IO.File]::Delete($temp) } }
+        }
+        catch { Write-FTLog "Settings could not be saved: $($_.Exception.Message)" 'WARN' }
+    }
+
+    # ---------------------------------------------------------------- changelog
+    function Initialize-FTChangelog {
+        [void](Get-FTDataFolder)
+        if ([IO.File]::Exists($script:FT.ChangelogFile)) {
+            try {
+                $loaded = @(Get-Content -LiteralPath $script:FT.ChangelogFile -Raw | ConvertFrom-Json)
+                if ($loaded.Count) { $script:FT.Changelog = $loaded; return }
+            }
+            catch { Write-FTLog "Changelog file could not be read; using the built-in release notes." 'WARN' }
+        }
+        $script:FT.Changelog = @(
+            [pscustomobject]@{
+                Version = '1.1.0'; Date = (Get-Date -Format 'yyyy-MM-dd'); Title = 'Showcase refresh'
+                New = @(
+                    'Dashboard rebuilt with live system cards',
+                    'Settings page with theme presets and accent colours',
+                    'What''s New screen plus a one-time update popup',
+                    'Copy system summary on the Hardware page',
+                    'Window size and position are remembered'
+                )
+                Improvements = @(
+                    'Forge Tweaks branding and purple theme across the app',
+                    'Clearer navigation with grouped sections',
+                    'Activity entries now carry severity levels'
+                )
+                Fixes = @(
+                    'Removed the remote download-and-run administrator relaunch path',
+                    'Removed unreviewed CPU, sleep and disk power overrides from plan creation',
+                    'ComboBox text is readable in dark mode'
+                )
+                Known = @(
+                    'Still a single PowerShell script; no installer or code signing yet',
+                    'Accounts, licensing and technician sessions are not implemented'
+                )
+                Notes = @('No migration needed. Existing backups are reused.')
+            }
+        )
+        try {
+            $json = ConvertTo-Json -InputObject $script:FT.Changelog -Depth 6
+            [IO.File]::WriteAllText($script:FT.ChangelogFile, $json, [Text.UTF8Encoding]::new($true))
+        }
+        catch { Write-FTLog "Changelog file could not be written: $($_.Exception.Message)" 'WARN' }
+    }
+
+    function Get-FTLatestRelease {
+        return @($script:FT.Changelog | Sort-Object { [version]([string]$_.Version) } -Descending)[0]
+    }
+
+    function Format-FTRelease {
+        param($Entry)
+        if ($null -eq $Entry) { return 'No release notes available.' }
+        $sb = [Text.StringBuilder]::new()
+        [void]$sb.AppendLine("$($Entry.Title)  -  v$($Entry.Version)  ($($Entry.Date))")
+        [void]$sb.AppendLine('')
+        foreach ($section in @(
+            @{ T = 'New features';     V = @($Entry.New) },
+            @{ T = 'Improvements';     V = @($Entry.Improvements) },
+            @{ T = 'Bug fixes';        V = @($Entry.Fixes) },
+            @{ T = 'Known issues';     V = @($Entry.Known) },
+            @{ T = 'Migration notes';  V = @($Entry.Notes) })) {
+            $items = @($section.V | Where-Object { $_ -and [string]$_ -ne '' })
+            if (-not $items.Count) { continue }
+            [void]$sb.AppendLine("$($section.T)")
+            foreach ($i in $items) { [void]$sb.AppendLine("  - $i") }
+            [void]$sb.AppendLine('')
+        }
+        return $sb.ToString().TrimEnd()
+    }
+
+    function Update-FTChangelogPage {
+        $sb = [Text.StringBuilder]::new()
+        $entries = @($script:FT.Changelog | Sort-Object { [version]([string]$_.Version) } -Descending)
+        foreach ($e in $entries) {
+            [void]$sb.AppendLine(('=' * 62))
+            [void]$sb.AppendLine((Format-FTRelease $e))
+            [void]$sb.AppendLine('')
+        }
+        $script:FT.UI.ChangelogBody.Text = $sb.ToString().TrimEnd()
+    }
+
+    # ---------------------------------------------------------------- backup
+    function Get-FTBackupPath {
+        [void](Get-FTDataFolder)
+        $script:FT.BackupFile = Join-Path $script:FT.Data 'originals.json'
+        return $script:FT.BackupFile
+    }
+
+    function Test-FTBackup {
+        param($Backup)
+        if ($null -eq $Backup) { throw 'The backup is empty.' }
+        foreach ($name in @('Version', 'Power', 'Plans', 'WallpaperSaved', 'Wallpaper', 'Tweaks')) {
+            if ($null -eq $Backup.PSObject.Properties[$name]) { throw "Backup property missing: $name" }
+        }
+        if ($Backup.Version -ne 2) { throw 'Unsupported backup version.' }
+        if ($Backup.Power -and $Backup.Power -notmatch "^$script:GuidPattern$") { throw 'Invalid saved power-plan identifier.' }
+        foreach ($p in @($Backup.Plans)) {
+            if ($p -notmatch "^$script:GuidPattern$") { throw 'Invalid created power-plan identifier.' }
+        }
+        if (-not $Backup.WallpaperSaved -and $Backup.Wallpaper) { throw 'The wallpaper backup flags are inconsistent.' }
+        if ($Backup.Wallpaper) {
+            $full = [IO.Path]::GetFullPath([string]$Backup.Wallpaper)
+            $parent = [IO.Path]::GetDirectoryName($full)
+            $expected = [IO.Path]::GetFullPath([string]$script:FT.Data)
+            $leaf = [IO.Path]::GetFileName($full)
+            if ($parent -ine $expected -or $leaf -notmatch '^original-[0-9a-f]{32}\.bmp$') {
+                throw 'Invalid saved wallpaper location.'
+            }
+        }
+    }
+
+    function Initialize-FTBackup {
+        try {
+            [void](Get-FTBackupPath)
+            if (Test-Path -LiteralPath $script:FT.BackupFile) {
+                $loaded = Get-Content -LiteralPath $script:FT.BackupFile -Raw | ConvertFrom-Json
+                Test-FTBackup $loaded
+                $loaded.Plans = @($loaded.Plans)
+                if ($null -eq $loaded.Tweaks) { $loaded.Tweaks = [pscustomobject]@{} }
+                $script:FT.Backup = $loaded
+            }
+            $script:FT.BackupReady = $true
+            $script:FT.BackupError = ''
+            Write-FTLog "Backup file: $script:FT.BackupFile"
+        }
+        catch {
+            $script:FT.BackupReady = $false
+            $script:FT.BackupError = $_.Exception.Message
+            Write-FTLog "Backup unavailable: $($script:FT.BackupError)" 'WARN'
+        }
+    }
+
+    function Save-FTBackup {
+        if (-not $script:FT.BackupReady) { throw "Settings changes blocked: $($script:FT.BackupError)" }
+        $file = Get-FTBackupPath
+        Test-FTBackup $script:FT.Backup
+        $temp = Join-Path $script:FT.Data ('save-{0}.tmp' -f [guid]::NewGuid().ToString('N'))
+        try {
+            $json = ConvertTo-Json -InputObject $script:FT.Backup -Depth 6
+            [IO.File]::WriteAllText($temp, $json, [Text.UTF8Encoding]::new($true))
+            [IO.File]::Copy($temp, $file, $true)
+        }
+        finally {
+            if ([IO.File]::Exists($temp)) { [IO.File]::Delete($temp) }
+        }
+    }
+
+    function Get-FTTweakBackupCount {
+        return @($script:FT.Backup.Tweaks.PSObject.Properties).Count
+    }
+
+    function Update-FTBackupDisplay {
+        $rows = $script:FT.UI.BackupRows
+        $rows.Items.Clear()
+        if (-not $script:FT.BackupReady) {
+            $script:FT.UI.BackupInfo.Text = "BACKUP UNAVAILABLE - changes are blocked.`r`n" + $script:FT.BackupError
+            return
+        }
+        try { [void](Get-FTBackupPath) } catch { Write-FTLog $_.Exception.Message 'WARN' }
+        $b = $script:FT.Backup
+
+        $r = [ForgeTweaks.Row]::new(); $r.Name = 'Original power plan'; $r.Category = 'power'
+        if ($b.Power) { $r.Detail = $b.Power; $r.Status = 'saved' } else { $r.Detail = 'Not captured yet'; $r.Status = 'empty' }
+        [void]$rows.Items.Add($r)
+
+        $r = [ForgeTweaks.Row]::new(); $r.Name = 'Forge Tweaks power plans created'; $r.Category = 'power'
+        $r.Detail = "$(@($b.Plans).Count) plan(s)"
+        if (@($b.Plans).Count) { $r.Status = 'saved' } else { $r.Status = 'empty' }
+        [void]$rows.Items.Add($r)
+
+        $r = [ForgeTweaks.Row]::new(); $r.Name = 'Original wallpaper'; $r.Category = 'desktop'
+        if ($b.WallpaperSaved) {
+            $r.Status = 'saved'
+            $r.Detail = if ($b.Wallpaper) { $b.Wallpaper } else { 'Originally no static wallpaper' }
+        }
+        else { $r.Status = 'empty'; $r.Detail = 'Not captured yet' }
+        [void]$rows.Items.Add($r)
+
+        foreach ($p in $b.Tweaks.PSObject.Properties) {
+            $def = $script:Tweaks | Where-Object { $_.Id -eq $p.Name } | Select-Object -First 1
+            $r = [ForgeTweaks.Row]::new(); $r.Category = 'tweak'; $r.Status = 'saved'; $r.Id = $p.Name
+            $r.Name = if ($def) { $def.Name } else { $p.Name }
+            $r.Detail = "$(@($p.Value).Count) registry value(s) backed up"
+            [void]$rows.Items.Add($r)
+        }
+        $script:FT.UI.BackupInfo.Text =
+            "Originals are kept after a restore, so you can still undo later.`r`n" +
+            "An application snapshot is not a full Windows backup - create a Windows restore point separately if you need one.`r`n" +
+            "Backup file: $($script:FT.BackupFile)"
+    }
+
+    # ---------------------------------------------------------------- registry
+    function Split-FTRegPath {
+        param([string]$Path)
+        if ($Path -match '^HKCU\\(.+)$') { return @([Microsoft.Win32.Registry]::CurrentUser, $Matches[1]) }
+        if ($Path -match '^HKLM\\(.+)$') { return @([Microsoft.Win32.Registry]::LocalMachine, $Matches[1]) }
+        throw "Unsupported registry path: $Path"
+    }
+
+    function Get-FTReg {
+        param([string]$Path, [string]$Name)
+        $hive, $sub = Split-FTRegPath $Path
+        $key = $hive.OpenSubKey($sub, $false)
+        if ($null -eq $key) { return [pscustomobject]@{ Existed = $false; Kind = ''; Data = $null } }
+        try {
+            if ($key.GetValueNames() -notcontains $Name) { return [pscustomobject]@{ Existed = $false; Kind = ''; Data = $null } }
+            $kind = $key.GetValueKind($Name).ToString()
+            $data = $key.GetValue($Name, $null, [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
+            if ($data -is [byte[]]) { $data = [Convert]::ToBase64String($data) }
+            elseif ($data -is [string[]]) { $data = @($data) }
+            return [pscustomobject]@{ Existed = $true; Kind = $kind; Data = $data }
+        }
+        finally { $key.Dispose() }
+    }
+
+    function Set-FTReg {
+        param([string]$Path, [string]$Name, [string]$Kind, $Data)
+        $hive, $sub = Split-FTRegPath $Path
+        $key = $hive.CreateSubKey($sub, $true)
+        if ($null -eq $key) { throw "Cannot open registry key for writing: $Path" }
+        try {
+            $rk = [Microsoft.Win32.RegistryValueKind]$Kind
+            switch ($rk) {
+                'DWord'       { $Data = [int][int64]$Data }
+                'QWord'       { $Data = [int64]$Data }
+                'Binary'      { $Data = [Convert]::FromBase64String([string]$Data) }
+                'MultiString' { $Data = [string[]]@($Data) }
+                default       { $Data = [string]$Data }
+            }
+            $key.SetValue($Name, $Data, $rk)
+        }
+        finally { $key.Dispose() }
+    }
+
+    function Remove-FTReg {
+        param([string]$Path, [string]$Name)
+        $hive, $sub = Split-FTRegPath $Path
+        $key = $hive.OpenSubKey($sub, $true)
+        if ($null -eq $key) { return }
+        try { $key.DeleteValue($Name, $false) } finally { $key.Dispose() }
+    }
+
+    # ---------------------------------------------------------------- tweaks
+    function Test-FTTweakApplied {
+        param($Tweak)
+        foreach ($v in $Tweak.Values) {
+            $cur = Get-FTReg $v.P $v.N
+            if (-not $cur.Existed) { return $false }
+            $want = $v.D
+            if ($v.K -eq 'DWord') { $want = [int]$want; $cur.Data = [int][int64]$cur.Data }
+            if ([string]$cur.Data -ne [string]$want) { return $false }
+        }
+        return $true
+    }
+
+    function Update-FTTweaks {
+        $list = $script:FT.UI.Tweaks
+        if ($null -eq $list) { return }
+        $filter = [string]$script:FT.UI.TweakFilter.Text
+        $cat = 'All'
+        if ($script:FT.UI.TweakCat.SelectedItem) { $cat = [string]$script:FT.UI.TweakCat.SelectedItem.Content }
+        $keep = @{}
+        foreach ($row in $list.Items) { if ($row.Selected) { $keep[$row.Id] = $true } }
+        $list.Items.Clear()
+        $applied = 0
+        foreach ($t in $script:Tweaks) {
+            $isApplied = Test-FTTweakApplied $t
+            if ($isApplied) { $applied++ }
+            if ($cat -ne 'All' -and $t.Cat -ne $cat) { continue }
+            if ($filter -and $t.Name -notlike "*$filter*" -and $t.Desc -notlike "*$filter*") { continue }
+            $r = [ForgeTweaks.Row]::new()
+            $r.Id = $t.Id; $r.Name = $t.Name; $r.Category = $t.Cat.ToLower(); $r.Detail = $t.Desc
+            if ($isApplied) { $r.Status = 'applied' }
+            elseif ($t.Admin -and -not $script:FT.IsAdmin) { $r.Status = 'needs admin' }
+            else { $r.Status = 'available' }
+            $r.Selected = $keep.ContainsKey($t.Id)
+            [void]$list.Items.Add($r)
+        }
+        $script:FT.AppliedCount = $applied
+        $script:FT.UI.TweakSummary.Text = "$applied of $($script:Tweaks.Count) tweaks are currently applied"
+    }
+
+    function Get-FTSelectedTweaks {
+        $ids = @($script:FT.UI.Tweaks.Items | Where-Object { $_.Selected } | ForEach-Object { $_.Id })
+        if (-not $ids.Count) { throw 'Select at least one tweak first.' }
+        return @($script:Tweaks | Where-Object { $ids -contains $_.Id })
+    }
+
+    function Apply-FTTweaks {
+        if (-not $script:FT.BackupReady) { throw "Backup unavailable: $($script:FT.BackupError)" }
+        $selected = Get-FTSelectedTweaks
+        $needAdmin = @($selected | Where-Object { $_.Admin -and -not $script:FT.IsAdmin })
+        if ($needAdmin.Count) {
+            throw "These tweaks need administrator rights:`r`n - " + (($needAdmin | ForEach-Object { $_.Name }) -join "`r`n - ") +
+                  "`r`n`r`nUse 'Restart as administrator' in the sidebar, or clear them."
+        }
+        $names = ($selected | ForEach-Object { " - $($_.Name)" }) -join "`r`n"
+        if (-not (Confirm-FT "Apply $($selected.Count) tweak(s)?`r`n`r`n$names`r`n`r`nOriginal values are saved first and can be restored from the Restore Center.")) { return }
+
+        foreach ($t in $selected) {
+            if ($null -eq $script:FT.Backup.Tweaks.PSObject.Properties[$t.Id]) {
+                $orig = foreach ($v in $t.Values) {
+                    $cur = Get-FTReg $v.P $v.N
+                    [pscustomobject]@{ Path = $v.P; Name = $v.N; Existed = $cur.Existed; Kind = $cur.Kind; Data = $cur.Data }
+                }
+                $script:FT.Backup.Tweaks | Add-Member -NotePropertyName $t.Id -NotePropertyValue @($orig)
+                Save-FTBackup
+            }
+            foreach ($v in $t.Values) { Set-FTReg $v.P $v.N $v.K $v.D }
+            Write-FTLog "Applied: $($t.Name)" 'OK'
+        }
+        Update-FTTweaks
+        Write-FTLog 'Some tweaks only take effect after signing out or restarting.' 'INFO'
+    }
+
+    function Revert-FTTweakById {
+        param([string]$Id)
+        $prop = $script:FT.Backup.Tweaks.PSObject.Properties[$Id]
+        $def = $script:Tweaks | Where-Object { $_.Id -eq $Id } | Select-Object -First 1
+        if ($null -eq $prop) {
+            if ($def -and (Test-FTTweakApplied $def)) {
+                throw "'$($def.Name)' was not applied by $script:FTProduct, so there is no original to restore."
+            }
+            return
+        }
+        foreach ($o in @($prop.Value)) {
+            if ($o.Existed) { Set-FTReg $o.Path $o.Name $o.Kind $o.Data }
+            else { Remove-FTReg $o.Path $o.Name }
+        }
+        $script:FT.Backup.Tweaks.PSObject.Properties.Remove($Id)
+        Save-FTBackup
+        $label = if ($def) { $def.Name } else { $Id }
+        Write-FTLog "Reverted: $label" 'OK'
+    }
+
+    function Revert-FTTweaks {
+        if (-not $script:FT.BackupReady) { throw "Backup unavailable: $($script:FT.BackupError)" }
+        $selected = Get-FTSelectedTweaks
+        $needAdmin = @($selected | Where-Object { $_.Admin -and -not $script:FT.IsAdmin })
+        if ($needAdmin.Count) { throw 'Reverting system tweaks requires administrator rights. Restart as administrator first.' }
+        if (-not (Confirm-FT "Restore $($selected.Count) tweak(s) to the values that were saved?")) { return }
+        $failures = [Collections.Generic.List[string]]::new()
+        foreach ($t in $selected) {
+            try { Revert-FTTweakById $t.Id } catch { $failures.Add($_.Exception.Message) }
+        }
+        Update-FTTweaks
+        if ($failures.Count) { throw ($failures -join "`r`n") }
+    }
+
+    function Select-FTTweaks {
+        param([bool]$State)
+        foreach ($row in $script:FT.UI.Tweaks.Items) {
+            if ($State -and $row.Status -eq 'needs admin') { continue }
+            $row.Selected = $State
+        }
+    }
+
+    # ---------------------------------------------------------------- power
+    function Invoke-FTPower {
+        param([string[]]$Arguments)
+        $info = [Diagnostics.ProcessStartInfo]::new()
+        $info.FileName = Join-Path $env:SystemRoot 'System32\powercfg.exe'
+        $info.Arguments = $Arguments -join ' '
+        $info.UseShellExecute = $false
+        $info.CreateNoWindow = $true
+        $info.RedirectStandardOutput = $true
+        $info.RedirectStandardError = $true
+        try { $info.StandardOutputEncoding = [Console]::OutputEncoding; $info.StandardErrorEncoding = [Console]::OutputEncoding } catch {}
+        $process = [Diagnostics.Process]::new()
+        $process.StartInfo = $info
+        try {
+            if (-not $process.Start()) { throw 'Could not start powercfg.' }
+            $stdout = $process.StandardOutput.ReadToEndAsync()
+            $stderr = $process.StandardError.ReadToEndAsync()
+            if (-not $process.WaitForExit(15000)) { try { $process.Kill() } catch {}; throw 'powercfg timed out.' }
+            $text = $stdout.Result.Trim()
+            if ($process.ExitCode -ne 0) { throw "powercfg failed: $text $($stderr.Result.Trim())".Trim() }
+            return $text
+        }
+        finally { $process.Dispose() }
+    }
+
+    function Get-FTActivePlan {
+        $text = Invoke-FTPower @('/getactivescheme')
+        $match = [regex]::Match($text, "\b$script:GuidPattern\b")
+        if (-not $match.Success) { throw 'Windows did not return an active power-plan identifier.' }
+        return $match.Value.ToLowerInvariant()
+    }
+
+    function Update-FTPlans {
+        $text = Invoke-FTPower @('/list')
+        $active = Get-FTActivePlan
+        $activeLabel = $active
+        $list = $script:FT.UI.Plans
+        $list.Items.Clear()
+        foreach ($line in ($text -split '\r?\n')) {
+            $match = [regex]::Match($line, "\b$script:GuidPattern\b")
+            if (-not $match.Success) { continue }
+            $id = $match.Value.ToLowerInvariant()
+            $label = $line.Trim()
+            if ($label -match '\(([^()]*)\)\s*\*?\s*$' -and $Matches[1].Trim()) { $label = $Matches[1].Trim() }
+            else { $label = $label.TrimEnd('*').Trim() }
+            $r = [ForgeTweaks.Row]::new()
+            $r.Id = $id; $r.Name = $label; $r.Detail = $id
+            $r.Category = if (@($script:FT.Backup.Plans) -contains $id) { 'forgetweaks' } else { 'windows' }
+            $r.Status = if ($id -eq $active) { 'active' } else { '' }
+            [void]$list.Items.Add($r)
+            if ($id -eq $active) { $list.SelectedItem = $r; $activeLabel = $label }
+        }
+        $script:FT.ActivePlanLabel = $activeLabel
+        $script:FT.UI.PlanStatus.Text = "Active power plan: $activeLabel"
+        Write-FTLog 'Read installed power plans. No settings changed.'
+    }
+
+    function Set-FTPlan {
+        $item = $script:FT.UI.Plans.SelectedItem
+        if ($null -eq $item) { throw 'Click Refresh, then select a plan.' }
+        $id = [string]$item.Id
+        if ($id -notmatch "^$script:GuidPattern$") { throw 'Invalid selected plan.' }
+        $current = Get-FTActivePlan
+        if ($current -eq $id) { Write-FTLog 'That power plan is already active.'; return }
+        if (-not (Confirm-FT "Switch to this power plan?`r`n`r`n$($item.Name)`r`n`r`nHigh-performance plans can increase heat and power use.")) { return }
+        if (-not $script:FT.Backup.Power) { $script:FT.Backup.Power = $current }
+        Save-FTBackup
+        [void](Invoke-FTPower @('/setactive', $id))
+        if ((Get-FTActivePlan) -ne $id) { throw 'Windows did not activate the selected power plan.' }
+        Write-FTLog "Activated power plan: $($item.Name)" 'OK'
+        Update-FTPlans
+    }
+
+    function New-FTPlan {
+        param([ValidateSet('Performance', 'Balanced')][string]$Kind)
+        if (-not $script:FT.BackupReady) { throw "Backup unavailable: $($script:FT.BackupError)" }
+        $name = "$script:FTProduct $Kind"
+        if (-not (Confirm-FT "Create and activate the '$name' power plan?`r`n`r`nYour current plan is saved and the new plan can be removed from the Restore Center.")) { return }
+
+        $bases = if ($Kind -eq 'Performance') {
+            @('e9a42b02-d5df-448d-aa00-03f14749eb61', '8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c')
+        } else { @('381b4222-f694-41f0-9685-ff5bb260df2e') }
+
+        $newId = $null
+        foreach ($base in $bases) {
+            try {
+                $out = Invoke-FTPower @('/duplicatescheme', $base)
+                $m = [regex]::Match($out, "\b$script:GuidPattern\b")
+                if ($m.Success) { $newId = $m.Value.ToLowerInvariant(); break }
+            }
+            catch { Write-FTLog "Base plan $base unavailable, trying the next one." 'WARN' }
+        }
+        if (-not $newId) { throw 'Windows could not duplicate a base power plan.' }
+
+        $current = Get-FTActivePlan
+        if (-not $script:FT.Backup.Power) { $script:FT.Backup.Power = $current }
+        $script:FT.Backup.Plans = @($script:FT.Backup.Plans) + $newId
+        Save-FTBackup
+
+        [void](Invoke-FTPower @('/changename', $newId, "`"$name`"", '"Created by Forge Tweaks. Remove it from the Restore Center."'))
+
+        # Deliberately no extra CPU, sleep, disk or device power overrides.
+        # The duplicated Windows template is used as-is so nothing about the
+        # plan is changed behind the user's back.
+        Write-FTLog 'Using the duplicated Windows plan template without applying extra CPU, sleep or disk overrides.' 'INFO'
+
+        [void](Invoke-FTPower @('/setactive', $newId))
+        if ((Get-FTActivePlan) -ne $newId) { throw "Created '$name' but Windows did not activate it." }
+        Write-FTLog "Created and activated '$name' ($newId)." 'OK'
+        Update-FTPlans
+    }
+
+    # ---------------------------------------------------------------- wallpaper
+    function Convert-FTBitmap {
+        param([string]$Source, [string]$Destination)
+        if (-not [IO.File]::Exists($Source)) { throw "Image file not found: $Source" }
+        $image = $null; $bitmap = $null
+        try {
+            try { $image = [Drawing.Image]::FromFile($Source) }
+            catch { throw "The image could not be decoded: $Source" }
+            $bitmap = [Drawing.Bitmap]::new($image)
+            $bitmap.Save($Destination, [Drawing.Imaging.ImageFormat]::Bmp)
+        }
+        finally { if ($bitmap) { $bitmap.Dispose() }; if ($image) { $image.Dispose() } }
+    }
+
+    function Select-FTImage {
+        $dialog = [Microsoft.Win32.OpenFileDialog]::new()
+        $dialog.Filter = 'Images|*.png;*.jpg;*.jpeg;*.bmp'
+        $dialog.Title = "$script:FTProduct | Choose a wallpaper"
+        if ($dialog.ShowDialog($script:FT.Window) -ne $true) { return }
+        $stream = [IO.File]::OpenRead($dialog.FileName)
+        try {
+            $image = [Windows.Media.Imaging.BitmapImage]::new()
+            $image.BeginInit()
+            $image.CacheOption = 'OnLoad'
+            $image.DecodePixelWidth = 1200
+            $image.StreamSource = $stream
+            $image.EndInit()
+            $image.Freeze()
+        }
+        finally { $stream.Dispose() }
+        $script:FT.ImagePath = $dialog.FileName
+        $script:FT.UI.Preview.Source = $image
+        $script:FT.UI.ImageName.Text = $dialog.FileName
+        Write-FTLog 'Wallpaper preview loaded. The desktop is unchanged.'
+    }
+
+    function Get-FTCurrentWallpaper {
+        $buffer = [Text.StringBuilder]::new(32768)
+        if (-not [ForgeTweaks.Native]::ReadWallpaper(115, [uint32]$buffer.Capacity, $buffer, 0)) {
+            throw 'Could not read the current wallpaper. Desktop unchanged.'
+        }
+        $current = $buffer.ToString().Trim()
+        if (-not $current) { return '' }
+        if ([IO.File]::Exists($current)) { return $current }
+        $transcoded = Join-Path $env:APPDATA 'Microsoft\Windows\Themes\TranscodedWallpaper'
+        if ([IO.File]::Exists($transcoded)) {
+            Write-FTLog "Original wallpaper file is missing; using Windows' cached copy." 'WARN'
+            return $transcoded
+        }
+        throw "The current wallpaper file no longer exists: $current. Desktop unchanged."
+    }
+
+    function Set-FTWallpaperNative {
+        param([AllowEmptyString()][string]$Path)
+        if ($Path -and -not [IO.File]::Exists($Path)) { throw "Wallpaper file is missing: $Path" }
+        if (-not [ForgeTweaks.Native]::WriteWallpaper(20, 0, $Path, 3)) {
+            throw "Windows rejected the wallpaper. Win32 error: $([Runtime.InteropServices.Marshal]::GetLastWin32Error())"
+        }
+    }
+
+    function Set-FTWallpaper {
+        if (-not $script:FT.ImagePath) { throw 'Choose an image first.' }
+        if (-not $script:FT.BackupReady) { throw "Backup unavailable: $($script:FT.BackupError)" }
+        if (-not [IO.File]::Exists($script:FT.ImagePath)) { throw 'The selected image no longer exists.' }
+        if (-not (Confirm-FT 'Apply this image as your desktop wallpaper? Only one static wallpaper can be restored (not slideshow or Spotlight).')) { return }
+        [void](Get-FTBackupPath)
+        if (-not $script:FT.Backup.WallpaperSaved) {
+            $current = Get-FTCurrentWallpaper
+            $original = ''
+            if ($current) {
+                $original = Join-Path $script:FT.Data ('original-{0}.bmp' -f [guid]::NewGuid().ToString('N'))
+                Convert-FTBitmap $current $original
+            }
+            $script:FT.Backup.Wallpaper = $original
+            $script:FT.Backup.WallpaperSaved = $true
+        }
+        if ($script:FT.Backup.Wallpaper -and -not [IO.File]::Exists($script:FT.Backup.Wallpaper)) {
+            throw 'The original wallpaper backup is missing. Desktop unchanged.'
+        }
+        Save-FTBackup
+        $destination = Join-Path $script:FT.Data ('applied-{0}.bmp' -f [guid]::NewGuid().ToString('N'))
+        Convert-FTBitmap $script:FT.ImagePath $destination
+        Set-FTWallpaperNative $destination
+        Write-FTLog 'Wallpaper applied.' 'OK'
+    }
+
+    # ---------------------------------------------------------------- restore
+    function Restore-FT {
+        if (-not $script:FT.BackupReady) { throw "Backup unavailable: $($script:FT.BackupError)" }
+        [void](Get-FTBackupPath)
+        $b = $script:FT.Backup
+        if (-not $b.Power -and -not $b.WallpaperSaved -and -not @($b.Plans).Count -and -not (Get-FTTweakBackupCount)) {
+            Write-FTLog 'There are no saved originals to restore.'; return
+        }
+        if (-not (Confirm-FT 'Restore everything that was changed (tweaks, power plan, created plans, wallpaper)? This can overwrite changes you made afterwards.')) { return }
+        Save-FTBackup
+        $failures = [Collections.Generic.List[string]]::new()
+
+        foreach ($id in @($b.Tweaks.PSObject.Properties | ForEach-Object { $_.Name })) {
+            $def = $script:Tweaks | Where-Object { $_.Id -eq $id } | Select-Object -First 1
+            if ($def -and $def.Admin -and -not $script:FT.IsAdmin) { $failures.Add("Needs administrator rights to restore: $($def.Name)"); continue }
+            try { Revert-FTTweakById $id } catch { $failures.Add($_.Exception.Message) }
+        }
+        if ($b.Power) {
+            try {
+                [void](Invoke-FTPower @('/setactive', $b.Power))
+                if ((Get-FTActivePlan) -ine $b.Power) { throw 'Power-plan restore verification failed.' }
+                Write-FTLog 'Original power plan restored.' 'OK'
+            }
+            catch { $failures.Add($_.Exception.Message) }
+        }
+        $remaining = @()
+        foreach ($p in @($b.Plans)) {
+            try { [void](Invoke-FTPower @('/delete', $p)); Write-FTLog "Removed created power plan $p." 'OK' }
+            catch { $remaining += $p; $failures.Add("Could not remove plan ${p}: $($_.Exception.Message)") }
+        }
+        $b.Plans = @($remaining)
+        Save-FTBackup
+        if ($b.WallpaperSaved) {
+            try { Set-FTWallpaperNative $b.Wallpaper; Write-FTLog 'Original wallpaper restored.' 'OK' }
+            catch { $failures.Add($_.Exception.Message) }
+        }
+        try { Update-FTPlans } catch {}
+        Update-FTTweaks
+        if ($failures.Count) { throw ($failures -join "`r`n") }
+        Write-FTLog 'Recovery finished. Saved originals are still available.' 'OK'
+    }
+
+    # ---------------------------------------------------------------- hardware
+    $script:FT.HardwareData = $null
+
+    function Read-FTHardware {
+        $script:FT.UI.Snapshot.Text = 'Reading hardware...'
+        Update-FTScreen
+        $os = Get-CimInstance Win32_OperatingSystem -OperationTimeoutSec 15
+        $cs = Get-CimInstance Win32_ComputerSystem -OperationTimeoutSec 15
+        $cpu = @(Get-CimInstance Win32_Processor -OperationTimeoutSec 15)
+        $gpu = @(Get-CimInstance Win32_VideoController -OperationTimeoutSec 15)
+        $disks = @(Get-CimInstance Win32_DiskDrive -OperationTimeoutSec 15)
+        $total = [double]$os.TotalVisibleMemorySize / 1MB
+        $free = [double]$os.FreePhysicalMemory / 1MB
+
+        $sb = [Text.StringBuilder]::new()
+        [void]$sb.AppendLine('SYSTEM')
+        [void]$sb.AppendLine("  Computer     : $($cs.Manufacturer) $($cs.Model)")
+        [void]$sb.AppendLine("  Windows      : $($os.Caption) (build $($os.BuildNumber))")
+        [void]$sb.AppendLine("  Architecture : $($os.OSArchitecture)")
+        [void]$sb.AppendLine('')
+        [void]$sb.AppendLine('PROCESSOR')
+        if ($cpu.Count) {
+            foreach ($c in $cpu) {
+                [void]$sb.AppendLine("  $($c.Name.Trim())")
+                [void]$sb.AppendLine("  $($c.NumberOfCores) cores / $($c.NumberOfLogicalProcessors) threads")
+            }
+        }
+        else { [void]$sb.AppendLine('  Not reported by Windows.') }
+        [void]$sb.AppendLine('')
+        [void]$sb.AppendLine('GRAPHICS')
+        if ($gpu.Count) {
+            foreach ($g in $gpu) {
+                [void]$sb.AppendLine("  $($g.Name)")
+                [void]$sb.AppendLine("  Driver $($g.DriverVersion)  |  $(if ($g.CurrentHorizontalResolution) { "$($g.CurrentHorizontalResolution)x$($g.CurrentVerticalResolution) @ $($g.CurrentRefreshRate)Hz" } else { 'Display mode not reported' })")
+                if ($g.AdapterRAM) { [void]$sb.AppendLine(('  Reported adapter memory: {0:N0} MB' -f ([double]$g.AdapterRAM / 1MB))) }
+            }
+        }
+        else { [void]$sb.AppendLine('  Not reported by Windows.') }
+        [void]$sb.AppendLine('')
+        [void]$sb.AppendLine('MEMORY')
+        [void]$sb.AppendLine(('  {0:N1} GB total, {1:N1} GB free ({2:N0}% in use)' -f $total, $free, (100 - (($free / $total) * 100))))
+        [void]$sb.AppendLine('')
+        [void]$sb.AppendLine('STORAGE')
+        if ($disks.Count) {
+            foreach ($d in $disks) {
+                $size = if ($d.Size) { '{0:N0} GB' -f ([double]$d.Size / 1GB) } else { 'size not reported' }
+                [void]$sb.AppendLine("  $($d.Model)  $size")
+            }
+        }
+        else { [void]$sb.AppendLine('  No physical disks reported.') }
+        [void]$sb.AppendLine('')
+        [void]$sb.AppendLine('POWER & SESSION')
+        [void]$sb.AppendLine("  Active power plan : $($script:FT.ActivePlanLabel)")
+        [void]$sb.AppendLine("  Running as        : $(if ($script:FT.IsAdmin) { 'Administrator' } else { 'Standard user' })")
+        [void]$sb.AppendLine("  $script:FTProduct version : $script:FTVersion")
+
+        $script:FT.HardwareSummary = $sb.ToString().TrimEnd()
+        $script:FT.UI.Snapshot.Text = $script:FT.HardwareSummary
+        Write-FTLog 'Hardware snapshot read. No settings changed.'
+    }
+
+    function Update-FTDashboard {
+        $ui = $script:FT.UI
+        $ui.HomePlan.Text = [string]$script:FT.ActivePlanLabel
+        $ui.HomeTweaks.Text = "$($script:FT.AppliedCount) of $($script:Tweaks.Count)"
+        $ui.HomeBackup.Text = if ($script:FT.BackupReady) { "$(Get-FTTweakBackupCount) original group(s) saved" } else { 'Unavailable' }
+        $ui.HomeAdmin.Text = if ($script:FT.IsAdmin) { 'Administrator' } else { 'Standard user' }
+        $ui.HomeVersion.Text = "v$script:FTVersion"
+        $ui.HomeBackupState.Text = if ($script:FT.BackupReady) { 'Backups are working' } else { "Backup problem: $($script:FT.BackupError)" }
+    }
+
+    function Read-FTDashboardSystem {
+        try {
+            $os = Get-CimInstance Win32_OperatingSystem -OperationTimeoutSec 15
+            $cpu = @(Get-CimInstance Win32_Processor -OperationTimeoutSec 15) | Select-Object -First 1
+            $gpu = @(Get-CimInstance Win32_VideoController -OperationTimeoutSec 15) | Select-Object -First 1
+            $cs  = Get-CimInstance Win32_ComputerSystem -OperationTimeoutSec 15
+            $total = [double]$os.TotalVisibleMemorySize / 1MB
+            $script:FT.UI.HomeOs.Text = "$($os.Caption) - build $($os.BuildNumber)"
+            $script:FT.UI.HomeCpu.Text = if ($cpu) { $cpu.Name.Trim() } else { 'Not reported by Windows' }
+            $script:FT.UI.HomeGpu.Text = if ($gpu) { $gpu.Name } else { 'Not reported by Windows' }
+            $script:FT.UI.HomeRam.Text = ('{0:N1} GB installed' -f $total)
+            $script:FT.UI.HomeMachine.Text = if ($cs) { "$($cs.Manufacturer) $($cs.Model)".Trim() } else { 'Not reported by Windows' }
+        }
+        catch {
+            $script:FT.UI.HomeOs.Text = 'System information unavailable'
+            Write-FTLog "Dashboard scan failed: $($_.Exception.Message)" 'WARN'
+        }
+    }
+
+    function Copy-FTSummary {
+        if (-not $script:FT.HardwareSummary) { Read-FTHardware }
+        [Windows.Clipboard]::SetText($script:FT.HardwareSummary)
+        Write-FTLog 'System summary copied to the clipboard.' 'OK'
+    }
+
+    # ---------------------------------------------------------------- relaunch
+    function Restart-FTAsAdmin {
+        if ($script:FT.IsAdmin) { Write-FTLog 'Already running as administrator.'; return }
+
+        if (-not $PSCommandPath -or -not (Test-Path -LiteralPath $PSCommandPath -PathType Leaf)) {
+            throw 'For safety, administrator restart is only available when this script is running from a saved local .ps1 file. Save and review the script, then run it locally.'
+        }
+        if (-not (Confirm-FT 'Relaunch this saved local script with administrator rights? Review the file before approving. This window will close.')) { return }
+
+        $powershell = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+        $localScript = (Resolve-Path -LiteralPath $PSCommandPath).Path
+        $quotedScript = '"' + $localScript.Replace('"', '""') + '"'
+        $arguments = "-NoProfile -ExecutionPolicy Bypass -STA -File $quotedScript"
+
+        Start-Process -FilePath $powershell -ArgumentList $arguments -Verb RunAs | Out-Null
+        $script:FT.Window.Close()
+    }
+
+    # ---------------------------------------------------------------- Whats New
+    function Show-FTWhatsNew {
+        param([switch]$Force)
+
+        $latest = Get-FTLatestRelease
+        if ($null -eq $latest) { return }
+        if (-not $Force) {
+            if (-not $script:FT.Settings.ShowWhatsNewOnUpdate) { return }
+            if ([string]$script:FT.Settings.LastSeenVersion -eq [string]$latest.Version) { return }
+        }
+
+        $script:FT.Settings.LastSeenVersion = [string]$latest.Version
+        Save-FTSettings
+
+        $popupXaml = @'
+<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="What's New" Width="660" Height="540" MinWidth="520" MinHeight="380"
+        WindowStartupLocation="CenterOwner" ResizeMode="CanResizeWithGrip"
+        Background="#0D0D10" FontFamily="Segoe UI" FontSize="13" Foreground="#E8E8EE">
+  <Window.Resources>
+    <Style x:Key="PBtn" TargetType="Button">
+      <Setter Property="Padding" Value="14,7"/>
+      <Setter Property="Foreground" Value="#E8E8EE"/>
+      <Setter Property="Background" Value="#1E1E25"/>
+      <Setter Property="BorderBrush" Value="#2C2C35"/>
+      <Setter Property="Cursor" Value="Hand"/>
+      <Setter Property="Template">
+        <Setter.Value>
+          <ControlTemplate TargetType="Button">
+            <Border x:Name="bd" Background="{TemplateBinding Background}" BorderBrush="{TemplateBinding BorderBrush}" BorderThickness="1" CornerRadius="6" Padding="{TemplateBinding Padding}">
+              <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center"/>
+            </Border>
+            <ControlTemplate.Triggers>
+              <Trigger Property="IsMouseOver" Value="True"><Setter TargetName="bd" Property="Opacity" Value="0.85"/></Trigger>
+            </ControlTemplate.Triggers>
+          </ControlTemplate>
+        </Setter.Value>
+      </Setter>
+    </Style>
+    <Style x:Key="PPrimary" TargetType="Button" BasedOn="{StaticResource PBtn}">
+      <Setter Property="Background" Value="#8B5CF6"/>
+      <Setter Property="BorderBrush" Value="#8B5CF6"/>
+      <Setter Property="Foreground" Value="White"/>
+      <Setter Property="FontWeight" Value="SemiBold"/>
+    </Style>
+  </Window.Resources>
+  <Grid Margin="20">
+    <Grid.RowDefinitions>
+      <RowDefinition Height="Auto"/>
+      <RowDefinition Height="*"/>
+      <RowDefinition Height="Auto"/>
+    </Grid.RowDefinitions>
+    <StackPanel>
+      <TextBlock x:Name="NewTitle" FontSize="19" FontWeight="Bold" Foreground="White" TextWrapping="Wrap"/>
+      <TextBlock x:Name="NewMeta" Foreground="#8A8A96" Margin="0,4,0,0"/>
+    </StackPanel>
+    <Border Grid.Row="1" Margin="0,14,0,0" Background="#17171C" BorderBrush="#26262E" BorderThickness="1" CornerRadius="8" Padding="14">
+      <TextBox x:Name="NewBody" IsReadOnly="True" BorderThickness="0" Background="Transparent"
+               Foreground="#E8E8EE" FontFamily="Consolas" FontSize="12"
+               TextWrapping="Wrap" VerticalScrollBarVisibility="Auto"/>
+    </Border>
+    <StackPanel Grid.Row="2" Orientation="Horizontal" HorizontalAlignment="Right" Margin="0,14,0,0">
+      <Button x:Name="NewViewAll" Style="{StaticResource PBtn}" Content="View full changelog"/>
+      <Button x:Name="NewClose" Style="{StaticResource PPrimary}" Content="Close"/>
+    </StackPanel>
+  </Grid>
+</Window>
+'@
+
+        $reader = [Xml.XmlNodeReader]::new([xml]$popupXaml)
+        $popup = [Windows.Markup.XamlReader]::Load($reader)
+        $popup.Owner = $script:FT.Window
+        $popup.Title = "$script:FTProduct | What's New"
+
+        $popup.FindName('NewTitle').Text = [string]$latest.Title
+        $popup.FindName('NewMeta').Text = "Version $($latest.Version) - released $($latest.Date)"
+        $popup.FindName('NewBody').Text = Format-FTRelease $latest
+
+        $goToChangelog = $false
+        $popup.FindName('NewClose').Add_Click({ $popup.Close() })
+        $popup.FindName('NewViewAll').Add_Click({
+            $goToChangelog = $true
+            $popup.Close()
+        })
+        [void]$popup.ShowDialog()
+        if ($goToChangelog) { Show-FTPage 'WhatsNew' }
+    }
+
+    # ---------------------------------------------------------------- settings UI
+    function Update-FTSettingsUI {
+        $ui = $script:FT.UI
+        foreach ($item in $ui.SetTheme.Items) {
+            if ([string]$item.Content -eq [string]$script:FT.Settings.ThemePreset) { $ui.SetTheme.SelectedItem = $item }
+        }
+        if ($null -eq $ui.SetTheme.SelectedItem) { $ui.SetTheme.SelectedIndex = 0 }
+
+        foreach ($item in $ui.SetAccent.Items) {
+            if ([string]$item.Content -eq [string]$script:FT.Settings.AccentColor) { $ui.SetAccent.SelectedItem = $item }
+        }
+        if ($null -eq $ui.SetAccent.SelectedItem) { $ui.SetAccent.SelectedIndex = 0 }
+
+        foreach ($item in $ui.SetStartPage.Items) {
+            if ([string]$item.Content -eq [string]$script:FT.Settings.StartPage) { $ui.SetStartPage.SelectedItem = $item }
+        }
+        if ($null -eq $ui.SetStartPage.SelectedItem) { $ui.SetStartPage.SelectedIndex = 0 }
+
+        $ui.SetWhatsNew.IsChecked = [bool]$script:FT.Settings.ShowWhatsNewOnUpdate
+        $ui.SetRemember.IsChecked  = [bool]$script:FT.Settings.RememberWindow
+        $ui.SetFilePath.Text = $script:FT.Data
+    }
+
+    function Save-FTSettingsFromUI {
+        $ui = $script:FT.UI
+        $s = $script:FT.Settings
+        if ($ui.SetTheme.SelectedItem)    { $s.ThemePreset = [string]$ui.SetTheme.SelectedItem.Content }
+        if ($ui.SetAccent.SelectedItem)   { $s.AccentColor = [string]$ui.SetAccent.SelectedItem.Content }
+        if ($ui.SetStartPage.SelectedItem){ $s.StartPage   = [string]$ui.SetStartPage.SelectedItem.Content }
+        $s.ShowWhatsNewOnUpdate = [bool]$ui.SetWhatsNew.IsChecked
+        $s.RememberWindow       = [bool]$ui.SetRemember.IsChecked
+        Save-FTSettings
+        Apply-FTTheme
+        Write-FTLog 'Settings saved.' 'OK'
+    }
+
+    function Reset-FTSettings {
+        if (-not (Confirm-FT 'Reset appearance and behaviour settings to their defaults? Your backups and tweak history are not affected.')) { return }
+        $defaults = [pscustomobject]@{
+            Version = 1; ThemePreset = 'Forge Purple'; AccentColor = '#8B5CF6'
+            StartPage = 'Dashboard'; ShowWhatsNewOnUpdate = $true; RememberWindow = $true
+            LastSeenVersion = [string]$script:FT.Settings.LastSeenVersion
+            WindowSaved = $script:FT.Settings.WindowSaved
+            WindowLeft = $script:FT.Settings.WindowLeft
+            WindowTop = $script:FT.Settings.WindowTop
+            WindowWidth = $script:FT.Settings.WindowWidth
+            WindowHeight = $script:FT.Settings.WindowHeight
+        }
+        $script:FT.Settings = $defaults
+        Save-FTSettings
+        Apply-FTTheme
+        Update-FTSettingsUI
+        Write-FTLog 'Settings reset to defaults.' 'OK'
+    }
+
+    # ---------------------------------------------------------------- XAML
+    $xaml = @'
+<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="Forge Tweaks" Width="1180" Height="740" MinWidth="1000" MinHeight="640"
+        WindowStartupLocation="CenterScreen" Background="{StaticResource Bg}"
+        FontFamily="Segoe UI" FontSize="13" Foreground="{StaticResource Text}">
+  <Window.Resources>
+    <SolidColorBrush x:Key="Bg"          Color="#0D0D10"/>
+    <SolidColorBrush x:Key="Panel"       Color="#121216"/>
+    <SolidColorBrush x:Key="CardBg"      Color="#17171C"/>
+    <SolidColorBrush x:Key="Line"        Color="#26262E"/>
+    <SolidColorBrush x:Key="Muted"       Color="#8A8A96"/>
+    <SolidColorBrush x:Key="Text"        Color="#E8E8EE"/>
+    <SolidColorBrush x:Key="Accent"      Color="#8B5CF6"/>
+    <SolidColorBrush x:Key="AccentSoft"  Color="#268B5CF6"/>
+    <SolidColorBrush x:Key="AccentRow"   Color="#408B5CF6"/>
+    <SolidColorBrush x:Key="AccentBadge" Color="#2D8B5CF6"/>
+
+    <Style x:Key="NavBtn" TargetType="Button">
+      <Setter Property="Background" Value="Transparent"/>
+      <Setter Property="Foreground" Value="#B9B9C4"/>
+      <Setter Property="HorizontalContentAlignment" Value="Left"/>
+      <Setter Property="Padding" Value="14,0"/>
+      <Setter Property="Height" Value="34"/>
+      <Setter Property="Margin" Value="10,2"/>
+      <Setter Property="Cursor" Value="Hand"/>
+      <Setter Property="Template">
+        <Setter.Value>
+          <ControlTemplate TargetType="Button">
+            <Border x:Name="bd" Background="{TemplateBinding Background}" CornerRadius="6" Padding="{TemplateBinding Padding}">
+              <ContentPresenter VerticalAlignment="Center" HorizontalAlignment="Left"/>
+            </Border>
+            <ControlTemplate.Triggers>
+              <Trigger Property="IsMouseOver" Value="True"><Setter TargetName="bd" Property="Background" Value="#1C1C22"/></Trigger>
+              <Trigger Property="Tag" Value="on">
+                <Setter TargetName="bd" Property="Background" Value="{StaticResource AccentRow}"/>
+                <Setter Property="Foreground" Value="#FFFFFF"/>
+              </Trigger>
+            </ControlTemplate.Triggers>
+          </ControlTemplate>
+        </Setter.Value>
+      </Setter>
+    </Style>
+
+    <Style x:Key="Btn" TargetType="Button">
+      <Setter Property="Background" Value="#1E1E25"/>
+      <Setter Property="Foreground" Value="{StaticResource Text}"/>
+      <Setter Property="BorderBrush" Value="#2C2C35"/>
+      <Setter Property="Padding" Value="14,7"/>
+      <Setter Property="Margin" Value="0,0,8,0"/>
+      <Setter Property="Cursor" Value="Hand"/>
+      <Setter Property="Template">
+        <Setter.Value>
+          <ControlTemplate TargetType="Button">
+            <Border x:Name="bd" Background="{TemplateBinding Background}" BorderBrush="{TemplateBinding BorderBrush}" BorderThickness="1" CornerRadius="6" Padding="{TemplateBinding Padding}">
+              <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center"/>
+            </Border>
+            <ControlTemplate.Triggers>
+              <Trigger Property="IsMouseOver" Value="True"><Setter TargetName="bd" Property="Opacity" Value="0.85"/></Trigger>
+              <Trigger Property="IsEnabled" Value="False"><Setter TargetName="bd" Property="Opacity" Value="0.4"/></Trigger>
+            </ControlTemplate.Triggers>
+          </ControlTemplate>
+        </Setter.Value>
+      </Setter>
+    </Style>
+    <Style x:Key="Primary" TargetType="Button" BasedOn="{StaticResource Btn}">
+      <Setter Property="Background" Value="{StaticResource Accent}"/>
+      <Setter Property="BorderBrush" Value="{StaticResource Accent}"/>
+      <Setter Property="Foreground" Value="White"/>
+      <Setter Property="FontWeight" Value="SemiBold"/>
+    </Style>
+    <Style x:Key="Outline" TargetType="Button" BasedOn="{StaticResource Btn}">
+      <Setter Property="Background" Value="{StaticResource AccentSoft}"/>
+      <Setter Property="BorderBrush" Value="{StaticResource Accent}"/>
+      <Setter Property="Foreground" Value="{StaticResource Text}"/>
+    </Style>
+
+    <Style x:Key="Card" TargetType="Border">
+      <Setter Property="Background" Value="{StaticResource CardBg}"/>
+      <Setter Property="BorderBrush" Value="{StaticResource Line}"/>
+      <Setter Property="BorderThickness" Value="1"/>
+      <Setter Property="CornerRadius" Value="8"/>
+      <Setter Property="Padding" Value="16"/>
+    </Style>
+    <Style x:Key="H1" TargetType="TextBlock">
+      <Setter Property="FontSize" Value="20"/><Setter Property="FontWeight" Value="Bold"/><Setter Property="Foreground" Value="White"/>
+    </Style>
+    <Style x:Key="Sub" TargetType="TextBlock">
+      <Setter Property="Foreground" Value="{StaticResource Muted}"/><Setter Property="Margin" Value="0,2,0,0"/><Setter Property="TextWrapping" Value="Wrap"/>
+    </Style>
+    <Style x:Key="CardLabel" TargetType="TextBlock">
+      <Setter Property="Foreground" Value="{StaticResource Muted}"/><Setter Property="FontSize" Value="11"/>
+      <Setter Property="TextTrimming" Value="CharacterEllipsis"/>
+    </Style>
+    <Style x:Key="CardValue" TargetType="TextBlock">
+      <Setter Property="Foreground" Value="{StaticResource Text}"/><Setter Property="FontSize" Value="14"/>
+      <Setter Property="FontWeight" Value="SemiBold"/><Setter Property="Margin" Value="0,6,0,0"/>
+      <Setter Property="TextTrimming" Value="CharacterEllipsis"/>
+    </Style>
+    <Style x:Key="SectionLbl" TargetType="TextBlock">
+      <Setter Property="Foreground" Value="#5E5E6A"/><Setter Property="FontSize" Value="11"/><Setter Property="Margin" Value="24,16,0,4"/>
+    </Style>
+
+    <Style TargetType="TextBox">
+      <Setter Property="Background" Value="#121216"/><Setter Property="Foreground" Value="{StaticResource Text}"/>
+      <Setter Property="BorderBrush" Value="#2C2C35"/><Setter Property="Padding" Value="8,6"/><Setter Property="CaretBrush" Value="White"/>
+    </Style>
+
+    <Style TargetType="ComboBox">
+      <Setter Property="Background" Value="#1E1E25"/>
+      <Setter Property="Foreground" Value="{StaticResource Text}"/>
+      <Setter Property="BorderBrush" Value="{StaticResource Line}"/>
+      <Setter Property="Padding" Value="8,5"/>
+      <Setter Property="MinHeight" Value="30"/>
+      <Setter Property="Template">
+        <Setter.Value>
+          <ControlTemplate TargetType="ComboBox">
+            <Grid>
+              <Border x:Name="bd" Background="{TemplateBinding Background}" BorderBrush="{TemplateBinding BorderBrush}" BorderThickness="1" CornerRadius="6">
+                <Grid>
+                  <Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="26"/></Grid.ColumnDefinitions>
+                  <ContentPresenter Margin="10,0,0,0" VerticalAlignment="Center"
+                                    Content="{TemplateBinding SelectionBoxItem}"
+                                    ContentTemplate="{TemplateBinding SelectionBoxItemTemplate}"/>
+                  <Path Grid.Column="1" HorizontalAlignment="Center" VerticalAlignment="Center"
+                        Data="M0,0 L8,0 L4,5 Z" Fill="{StaticResource Muted}"/>
+                </Grid>
+              </Border>
+              <ToggleButton Background="Transparent" BorderThickness="0" Focusable="False" ClickMode="Press"
+                            IsChecked="{Binding IsDropDownOpen, Mode=TwoWay, RelativeSource={RelativeSource TemplatedParent}}">
+                <ToggleButton.Template>
+                  <ControlTemplate TargetType="ToggleButton"><Border Background="Transparent"/></ControlTemplate>
+                </ToggleButton.Template>
+              </ToggleButton>
+              <Popup x:Name="PART_Popup" AllowsTransparency="True" Placement="Bottom" PopupAnimation="None"
+                     IsOpen="{TemplateBinding IsDropDownOpen}">
+                <Border Background="{StaticResource CardBg}" BorderBrush="{StaticResource Line}" BorderThickness="1"
+                        CornerRadius="6" Padding="2" MinWidth="{TemplateBinding ActualWidth}" MaxHeight="{TemplateBinding MaxDropDownHeight}">
+                  <ScrollViewer><StackPanel IsItemsHost="True"/></ScrollViewer>
+                </Border>
+              </Popup>
+            </Grid>
+          </ControlTemplate>
+        </Setter.Value>
+      </Setter>
+    </Style>
+    <Style TargetType="ComboBoxItem">
+      <Setter Property="Background" Value="Transparent"/>
+      <Setter Property="Foreground" Value="{StaticResource Text}"/>
+      <Setter Property="Padding" Value="10,6"/>
+    </Style>
+
+    <Style TargetType="CheckBox">
+      <Setter Property="Foreground" Value="{StaticResource Text}"/>
+      <Setter Property="Margin" Value="0,4,0,4"/>
+    </Style>
+
+    <Style TargetType="ListView">
+      <Setter Property="Background" Value="Transparent"/><Setter Property="BorderThickness" Value="0"/>
+      <Setter Property="Foreground" Value="{StaticResource Text}"/>
+      <Setter Property="ScrollViewer.HorizontalScrollBarVisibility" Value="Disabled"/>
+    </Style>
+    <Style TargetType="ListViewItem">
+      <Setter Property="Background" Value="#141419"/>
+      <Setter Property="Margin" Value="0,0,0,6"/>
+      <Setter Property="Padding" Value="8,9"/>
+      <Setter Property="BorderThickness" Value="0"/>
+      <Setter Property="HorizontalContentAlignment" Value="Stretch"/>
+      <Setter Property="Template">
+        <Setter.Value>
+          <ControlTemplate TargetType="ListViewItem">
+            <Border x:Name="bd" Background="{TemplateBinding Background}" CornerRadius="6" Padding="{TemplateBinding Padding}">
+              <GridViewRowPresenter VerticalAlignment="Center"/>
+            </Border>
+            <ControlTemplate.Triggers>
+              <Trigger Property="IsMouseOver" Value="True"><Setter TargetName="bd" Property="Background" Value="#1C1C23"/></Trigger>
+              <Trigger Property="IsSelected" Value="True"><Setter TargetName="bd" Property="Background" Value="{StaticResource AccentRow}"/></Trigger>
+            </ControlTemplate.Triggers>
+          </ControlTemplate>
+        </Setter.Value>
+      </Setter>
+    </Style>
+    <Style TargetType="GridViewColumnHeader">
+      <Setter Property="Background" Value="Transparent"/><Setter Property="Foreground" Value="{StaticResource Muted}"/>
+      <Setter Property="BorderThickness" Value="0"/><Setter Property="Padding" Value="8,6"/>
+      <Setter Property="HorizontalContentAlignment" Value="Left"/><Setter Property="FontSize" Value="12"/>
+      <Setter Property="Template">
+        <Setter.Value>
+          <ControlTemplate TargetType="GridViewColumnHeader">
+            <Border Background="Transparent" Padding="{TemplateBinding Padding}" BorderBrush="{StaticResource Line}" BorderThickness="0,0,0,1">
+              <ContentPresenter HorizontalAlignment="Left" VerticalAlignment="Center"/>
+            </Border>
+          </ControlTemplate>
+        </Setter.Value>
+      </Setter>
+    </Style>
+
+    <DataTemplate x:Key="BadgeCell">
+      <Border x:Name="b" CornerRadius="4" Padding="8,2" HorizontalAlignment="Left" Background="#2A2A33">
+        <TextBlock x:Name="t" Text="{Binding Status}" FontSize="11" Foreground="#A0A0AC"/>
+      </Border>
+      <DataTemplate.Triggers>
+        <DataTrigger Binding="{Binding Status}" Value="applied"><Setter TargetName="b" Property="Background" Value="#1F3A2A"/><Setter TargetName="t" Property="Foreground" Value="#4ADE80"/></DataTrigger>
+        <DataTrigger Binding="{Binding Status}" Value="active"><Setter TargetName="b" Property="Background" Value="#1F3A2A"/><Setter TargetName="t" Property="Foreground" Value="#4ADE80"/></DataTrigger>
+        <DataTrigger Binding="{Binding Status}" Value="saved"><Setter TargetName="b" Property="Background" Value="#1F3A2A"/><Setter TargetName="t" Property="Foreground" Value="#4ADE80"/></DataTrigger>
+        <DataTrigger Binding="{Binding Status}" Value="available"><Setter TargetName="b" Property="Background" Value="#2A2A33"/><Setter TargetName="t" Property="Foreground" Value="#A0A0AC"/></DataTrigger>
+        <DataTrigger Binding="{Binding Status}" Value="needs admin"><Setter TargetName="b" Property="Background" Value="{StaticResource AccentBadge}"/><Setter TargetName="t" Property="Foreground" Value="{StaticResource Accent}"/></DataTrigger>
+        <DataTrigger Binding="{Binding Status}" Value="empty"><Setter TargetName="b" Property="Visibility" Value="Collapsed"/></DataTrigger>
+        <DataTrigger Binding="{Binding Status}" Value=""><Setter TargetName="b" Property="Visibility" Value="Collapsed"/></DataTrigger>
+      </DataTemplate.Triggers>
+    </DataTemplate>
+
+    <DataTemplate x:Key="CatCell">
+      <Border x:Name="b" CornerRadius="4" Padding="8,2" HorizontalAlignment="Left" Background="#2A2A33">
+        <TextBlock x:Name="t" Text="{Binding Category}" FontSize="11" Foreground="#A0A0AC"/>
+      </Border>
+      <DataTemplate.Triggers>
+        <DataTrigger Binding="{Binding Category}" Value="forgetweaks"><Setter TargetName="b" Property="Background" Value="{StaticResource AccentBadge}"/><Setter TargetName="t" Property="Foreground" Value="{StaticResource Accent}"/></DataTrigger>
+        <DataTrigger Binding="{Binding Category}" Value="gaming"><Setter TargetName="b" Property="Background" Value="{StaticResource AccentBadge}"/><Setter TargetName="t" Property="Foreground" Value="{StaticResource Accent}"/></DataTrigger>
+        <DataTrigger Binding="{Binding Category}" Value="windows"><Setter TargetName="b" Property="Background" Value="#1F3A2A"/><Setter TargetName="t" Property="Foreground" Value="#4ADE80"/></DataTrigger>
+        <DataTrigger Binding="{Binding Category}" Value="tweak"><Setter TargetName="b" Property="Background" Value="#1F3A2A"/><Setter TargetName="t" Property="Foreground" Value="#4ADE80"/></DataTrigger>
+        <DataTrigger Binding="{Binding Category}" Value="power"><Setter TargetName="b" Property="Background" Value="#243040"/><Setter TargetName="t" Property="Foreground" Value="#7FB3F0"/></DataTrigger>
+        <DataTrigger Binding="{Binding Category}" Value="desktop"><Setter TargetName="b" Property="Background" Value="#3A3320"/><Setter TargetName="t" Property="Foreground" Value="#E0C070"/></DataTrigger>
+      </DataTemplate.Triggers>
+    </DataTemplate>
+
+    <DataTemplate x:Key="CheckCell">
+      <CheckBox IsChecked="{Binding Selected, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}" VerticalAlignment="Center"/>
+    </DataTemplate>
+    <DataTemplate x:Key="NameCell">
+      <StackPanel>
+        <TextBlock Text="{Binding Name}" Foreground="{StaticResource Text}" TextTrimming="CharacterEllipsis"/>
+        <TextBlock Text="{Binding Detail}" Foreground="{StaticResource Muted}" FontSize="11" TextTrimming="CharacterEllipsis"/>
+      </StackPanel>
+    </DataTemplate>
+    <DataTemplate x:Key="PlainCell">
+      <TextBlock Text="{Binding Name}" Foreground="{StaticResource Text}" VerticalAlignment="Center" TextTrimming="CharacterEllipsis"/>
+    </DataTemplate>
+    <DataTemplate x:Key="DetailCell">
+      <TextBlock Text="{Binding Detail}" Foreground="{StaticResource Muted}" FontSize="11" VerticalAlignment="Center" TextTrimming="CharacterEllipsis"/>
+    </DataTemplate>
+  </Window.Resources>
+
+  <Grid>
+    <Grid.ColumnDefinitions>
+      <ColumnDefinition Width="210"/>
+      <ColumnDefinition Width="*"/>
+    </Grid.ColumnDefinitions>
+
+    <!-- Sidebar -->
+    <Border Grid.Column="0" Background="{StaticResource Panel}" BorderBrush="{StaticResource Line}" BorderThickness="0,0,1,0">
+      <DockPanel>
+        <StackPanel DockPanel.Dock="Top" Margin="24,20,0,10">
+          <TextBlock Text="FORGE" FontSize="20" FontWeight="Black" Foreground="White"/>
+          <TextBlock Text="T W E A K S" FontSize="9" Foreground="{StaticResource Accent}" Margin="2,-4,0,0"/>
+        </StackPanel>
+
+        <Border DockPanel.Dock="Bottom" Padding="14,12" BorderBrush="{StaticResource Line}" BorderThickness="0,1,0,0">
+          <StackPanel>
+            <Button x:Name="BtnAdmin" Style="{StaticResource Outline}" Content="Restart as administrator" Margin="0,0,0,10" HorizontalAlignment="Stretch"/>
+            <StackPanel Orientation="Horizontal">
+              <Border Width="28" Height="28" CornerRadius="14" Background="{StaticResource AccentBadge}">
+                <TextBlock Text="F" HorizontalAlignment="Center" VerticalAlignment="Center" FontWeight="Bold" Foreground="{StaticResource Accent}"/>
+              </Border>
+              <StackPanel Margin="8,0,0,0">
+                <TextBlock Text="Forge Tweaks" FontWeight="SemiBold"/>
+                <TextBlock x:Name="UserLabel" Text="Standard user" FontSize="11" Foreground="{StaticResource Muted}"/>
+              </StackPanel>
+            </StackPanel>
+          </StackPanel>
+        </Border>
+
+        <ScrollViewer VerticalScrollBarVisibility="Auto">
+          <StackPanel x:Name="Nav">
+            <TextBlock Text="General" Style="{StaticResource SectionLbl}"/>
+            <Button x:Name="NavDashboard" Style="{StaticResource NavBtn}" Content="Dashboard"/>
+            <Button x:Name="NavTweaks" Style="{StaticResource NavBtn}" Content="Tweaks"/>
+            <Button x:Name="NavPower" Style="{StaticResource NavBtn}" Content="Power Plans"/>
+            <Button x:Name="NavHardware" Style="{StaticResource NavBtn}" Content="Hardware"/>
+            <TextBlock Text="Safety" Style="{StaticResource SectionLbl}"/>
+            <Button x:Name="NavRestore" Style="{StaticResource NavBtn}" Content="Restore Center"/>
+            <Button x:Name="NavActivity" Style="{StaticResource NavBtn}" Content="Activity"/>
+            <TextBlock Text="Customization" Style="{StaticResource SectionLbl}"/>
+            <Button x:Name="NavWallpaper" Style="{StaticResource NavBtn}" Content="Wallpaper"/>
+            <Button x:Name="NavSettings" Style="{StaticResource NavBtn}" Content="Settings"/>
+            <TextBlock Text="Information" Style="{StaticResource SectionLbl}"/>
+            <Button x:Name="NavWhatsNew" Style="{StaticResource NavBtn}" Content="What's New"/>
+            <Button x:Name="NavAbout" Style="{StaticResource NavBtn}" Content="About"/>
+          </StackPanel>
+        </ScrollViewer>
+      </DockPanel>
+    </Border>
+
+    <!-- Content -->
+    <Grid Grid.Column="1" x:Name="Body" Margin="24,20,24,16">
+      <Grid.RowDefinitions>
+        <RowDefinition Height="Auto"/>
+        <RowDefinition Height="*"/>
+        <RowDefinition Height="Auto"/>
+      </Grid.RowDefinitions>
+
+      <Grid Grid.Row="0" Margin="0,0,0,16">
+        <StackPanel>
+          <TextBlock x:Name="PageTitle" Style="{StaticResource H1}" Text="Dashboard"/>
+          <TextBlock x:Name="PageSub" Style="{StaticResource Sub}" Text="Overview of this PC and your Forge Tweaks session."/>
+        </StackPanel>
+        <Border HorizontalAlignment="Right" VerticalAlignment="Top" CornerRadius="8" BorderBrush="{StaticResource Accent}" BorderThickness="1" Padding="14,6" Background="{StaticResource AccentSoft}">
+          <StackPanel Orientation="Horizontal">
+            <TextBlock Text="●" Foreground="{StaticResource Accent}" Margin="0,0,8,0"/>
+            <TextBlock x:Name="Status" Text="Ready" FontWeight="SemiBold"/>
+          </StackPanel>
+        </Border>
+      </Grid>
+
+      <Grid Grid.Row="1">
+
+        <!-- Dashboard -->
+        <Grid x:Name="PageDashboard">
+          <ScrollViewer VerticalScrollBarVisibility="Auto">
+            <StackPanel>
+              <UniformGrid Columns="4" Margin="0,0,0,14">
+                <Border Style="{StaticResource Card}" Margin="0,0,10,0">
+                  <StackPanel>
+                    <TextBlock Text="Windows" Style="{StaticResource CardLabel}"/>
+                    <TextBlock x:Name="HomeOs" Text="Scanning..." Style="{StaticResource CardValue}" TextWrapping="Wrap"/>
+                  </StackPanel>
+                </Border>
+                <Border Style="{StaticResource Card}" Margin="0,0,10,0">
+                  <StackPanel>
+                    <TextBlock Text="Processor" Style="{StaticResource CardLabel}"/>
+                    <TextBlock x:Name="HomeCpu" Text="Scanning..." Style="{StaticResource CardValue}" TextWrapping="Wrap"/>
+                  </StackPanel>
+                </Border>
+                <Border Style="{StaticResource Card}" Margin="0,0,10,0">
+                  <StackPanel>
+                    <TextBlock Text="Graphics" Style="{StaticResource CardLabel}"/>
+                    <TextBlock x:Name="HomeGpu" Text="Scanning..." Style="{StaticResource CardValue}" TextWrapping="Wrap"/>
+                  </StackPanel>
+                </Border>
+                <Border Style="{StaticResource Card}">
+                  <StackPanel>
+                    <TextBlock Text="Memory" Style="{StaticResource CardLabel}"/>
+                    <TextBlock x:Name="HomeRam" Text="Scanning..." Style="{StaticResource CardValue}" TextWrapping="Wrap"/>
+                  </StackPanel>
+                </Border>
+              </UniformGrid>
+
+              <UniformGrid Columns="4" Margin="0,0,0,14">
+                <Border Style="{StaticResource Card}" Margin="0,0,10,0">
+                  <StackPanel>
+                    <TextBlock Text="Active power plan" Style="{StaticResource CardLabel}"/>
+                    <TextBlock x:Name="HomePlan" Text="-" Style="{StaticResource CardValue}" TextWrapping="Wrap"/>
+                  </StackPanel>
+                </Border>
+                <Border Style="{StaticResource Card}" Margin="0,0,10,0">
+                  <StackPanel>
+                    <TextBlock Text="Tweaks applied" Style="{StaticResource CardLabel}"/>
+                    <TextBlock x:Name="HomeTweaks" Text="-" Style="{StaticResource CardValue}" TextWrapping="Wrap"/>
+                  </StackPanel>
+                </Border>
+                <Border Style="{StaticResource Card}" Margin="0,0,10,0">
+                  <StackPanel>
+                    <TextBlock Text="Saved originals" Style="{StaticResource CardLabel}"/>
+                    <TextBlock x:Name="HomeBackup" Text="-" Style="{StaticResource CardValue}" TextWrapping="Wrap"/>
+                  </StackPanel>
+                </Border>
+                <Border Style="{StaticResource Card}">
+                  <StackPanel>
+                    <TextBlock Text="Session" Style="{StaticResource CardLabel}"/>
+                    <TextBlock x:Name="HomeAdmin" Text="-" Style="{StaticResource CardValue}" TextWrapping="Wrap"/>
+                  </StackPanel>
+                </Border>
+              </UniformGrid>
+
+              <Border Style="{StaticResource Card}" Margin="0,0,0,14">
+                <StackPanel>
+                  <TextBlock Text="Quick actions" FontWeight="SemiBold" FontSize="15"/>
+                  <TextBlock Style="{StaticResource Sub}" Text="Every change is saved first and can be undone from the Restore Center."/>
+                  <WrapPanel Margin="0,14,0,0">
+                    <Button x:Name="BtnQuickScan" Style="{StaticResource Btn}" Content="Scan this PC"/>
+                    <Button x:Name="BtnQuickTweaks" Style="{StaticResource Primary}" Content="Browse tweaks"/>
+                    <Button x:Name="BtnQuickHardware" Style="{StaticResource Btn}" Content="Full hardware report"/>
+                    <Button x:Name="BtnQuickRestore" Style="{StaticResource Btn}" Content="Restore Center"/>
+                    <Button x:Name="BtnQuickWhatsNew" Style="{StaticResource Btn}" Content="What's New" Margin="0"/>
+                  </WrapPanel>
+                </StackPanel>
+              </Border>
+
+              <Border Style="{StaticResource Card}">
+                <Grid>
+                  <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="*"/>
+                    <ColumnDefinition Width="Auto"/>
+                  </Grid.ColumnDefinitions>
+                  <StackPanel>
+                    <TextBlock Text="This build" FontWeight="SemiBold" FontSize="15"/>
+                    <TextBlock x:Name="HomeMachine" Style="{StaticResource Sub}" Text="Scanning..."/>
+                    <TextBlock x:Name="HomeBackupState" Style="{StaticResource Sub}" Text=""/>
+                  </StackPanel>
+                  <StackPanel Grid.Column="1" HorizontalAlignment="Right">
+                    <TextBlock Text="Version" Style="{StaticResource CardLabel}" HorizontalAlignment="Right"/>
+                    <TextBlock x:Name="HomeVersion" Text="-" FontSize="16" FontWeight="SemiBold" HorizontalAlignment="Right"/>
+                  </StackPanel>
+                </Grid>
+              </Border>
+            </StackPanel>
+          </ScrollViewer>
+        </Grid>
+
+        <!-- Tweaks -->
+        <Grid x:Name="PageTweaks" Visibility="Collapsed">
+          <Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="*"/><RowDefinition Height="Auto"/></Grid.RowDefinitions>
+          <DockPanel Margin="0,0,0,12">
+            <StackPanel DockPanel.Dock="Right" Orientation="Horizontal">
+              <Button x:Name="BtnTweakAll" Style="{StaticResource Btn}" Content="Select all"/>
+              <Button x:Name="BtnTweakNone" Style="{StaticResource Btn}" Content="Clear"/>
+              <Button x:Name="BtnTweakRevert" Style="{StaticResource Btn}" Content="Restore selected"/>
+              <Button x:Name="BtnTweakApply" Style="{StaticResource Primary}" Content="Apply selected" Margin="0"/>
+            </StackPanel>
+            <ComboBox x:Name="TweakCat" Width="130" Margin="0,0,8,0" SelectedIndex="0">
+              <ComboBoxItem Content="All"/><ComboBoxItem Content="Gaming"/><ComboBoxItem Content="System"/>
+              <ComboBoxItem Content="Privacy"/><ComboBoxItem Content="Network"/>
+            </ComboBox>
+            <TextBox x:Name="TweakFilter" Width="220" HorizontalAlignment="Left" ToolTip="Search tweaks"/>
+          </DockPanel>
+          <ListView Grid.Row="1" x:Name="Tweaks">
+            <ListView.View><GridView>
+              <GridViewColumn Width="36" CellTemplate="{StaticResource CheckCell}"/>
+              <GridViewColumn Header="Tweak" Width="500" CellTemplate="{StaticResource NameCell}"/>
+              <GridViewColumn Header="Category" Width="110" CellTemplate="{StaticResource CatCell}"/>
+              <GridViewColumn Header="State" Width="120" CellTemplate="{StaticResource BadgeCell}"/>
+            </GridView></ListView.View>
+          </ListView>
+          <TextBlock Grid.Row="2" x:Name="TweakSummary" Style="{StaticResource Sub}" Margin="0,10,0,0"/>
+        </Grid>
+
+        <!-- Power -->
+        <Grid x:Name="PagePower" Visibility="Collapsed">
+          <Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="*"/><RowDefinition Height="Auto"/></Grid.RowDefinitions>
+          <WrapPanel Margin="0,0,0,12">
+            <Button x:Name="BtnPlansRefresh" Style="{StaticResource Btn}" Content="Refresh"/>
+            <Button x:Name="BtnPlanActivate" Style="{StaticResource Btn}" Content="Activate selected"/>
+            <Button x:Name="BtnPlanBalanced" Style="{StaticResource Outline}" Content="+ Balanced plan"/>
+            <Button x:Name="BtnPlanPerf" Style="{StaticResource Primary}" Content="+ Performance plan"/>
+          </WrapPanel>
+          <ListView Grid.Row="1" x:Name="Plans">
+            <ListView.View><GridView>
+              <GridViewColumn Header="Plan name" Width="430" CellTemplate="{StaticResource PlainCell}"/>
+              <GridViewColumn Header="Type" Width="130" CellTemplate="{StaticResource CatCell}"/>
+              <GridViewColumn Header="State" Width="100" CellTemplate="{StaticResource BadgeCell}"/>
+            </GridView></ListView.View>
+          </ListView>
+          <TextBlock Grid.Row="2" x:Name="PlanStatus" Style="{StaticResource Sub}" Margin="0,10,0,0" Text="Active power plan: -"/>
+        </Grid>
+
+        <!-- Hardware -->
+        <Grid x:Name="PageHardware" Visibility="Collapsed">
+          <Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="*"/></Grid.RowDefinitions>
+          <StackPanel Orientation="Horizontal" Margin="0,0,0,12">
+            <Button x:Name="BtnHardware" Style="{StaticResource Btn}" Content="Scan this PC"/>
+            <Button x:Name="BtnCopySummary" Style="{StaticResource Btn}" Content="Copy summary"/>
+          </StackPanel>
+          <Border Grid.Row="1" Style="{StaticResource Card}">
+            <TextBox x:Name="Snapshot" IsReadOnly="True" BorderThickness="0" Background="Transparent"
+                     FontFamily="Consolas" FontSize="12" TextWrapping="Wrap"
+                     VerticalScrollBarVisibility="Auto" Text="Click 'Scan this PC' to read the hardware. Nothing is changed by scanning."/>
+          </Border>
+        </Grid>
+
+        <!-- Restore -->
+        <Grid x:Name="PageRestore" Visibility="Collapsed">
+          <Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="*"/><RowDefinition Height="Auto"/></Grid.RowDefinitions>
+          <StackPanel Orientation="Horizontal" Margin="0,0,0,12">
+            <Button x:Name="BtnBackupRefresh" Style="{StaticResource Btn}" Content="Refresh"/>
+            <Button x:Name="BtnRestore" Style="{StaticResource Primary}" Content="Restore everything"/>
+          </StackPanel>
+          <ListView Grid.Row="1" x:Name="BackupRows">
+            <ListView.View><GridView>
+              <GridViewColumn Header="Item" Width="330" CellTemplate="{StaticResource NameCell}"/>
+              <GridViewColumn Header="Type" Width="120" CellTemplate="{StaticResource CatCell}"/>
+              <GridViewColumn Header="State" Width="110" CellTemplate="{StaticResource BadgeCell}"/>
+            </GridView></ListView.View>
+          </ListView>
+          <TextBlock Grid.Row="2" x:Name="BackupInfo" Style="{StaticResource Sub}" Margin="0,10,0,0"/>
+        </Grid>
+
+        <!-- Activity -->
+        <Grid x:Name="PageActivity" Visibility="Collapsed">
+          <Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="*"/></Grid.RowDefinitions>
+          <StackPanel Orientation="Horizontal" Margin="0,0,0,12">
+            <Button x:Name="BtnCopyLog" Style="{StaticResource Btn}" Content="Copy log"/>
+            <Button x:Name="BtnClearLogView" Style="{StaticResource Btn}" Content="Clear this view"/>
+          </StackPanel>
+          <Border Grid.Row="1" Style="{StaticResource Card}">
+            <TextBox x:Name="Log" IsReadOnly="True" BorderThickness="0" Background="Transparent"
+                     FontFamily="Consolas" FontSize="12" TextWrapping="Wrap" VerticalScrollBarVisibility="Auto"/>
+          </Border>
+        </Grid>
+
+        <!-- Wallpaper -->
+        <Grid x:Name="PageWallpaper" Visibility="Collapsed">
+          <Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="*"/><RowDefinition Height="Auto"/></Grid.RowDefinitions>
+          <StackPanel Orientation="Horizontal" Margin="0,0,0,12">
+            <Button x:Name="BtnChooseImage" Style="{StaticResource Btn}" Content="Choose image"/>
+            <Button x:Name="BtnApplyWallpaper" Style="{StaticResource Primary}" Content="Apply wallpaper"/>
+          </StackPanel>
+          <Border Grid.Row="1" Style="{StaticResource Card}" Padding="8">
+            <Image x:Name="Preview" Stretch="Uniform"/>
+          </Border>
+          <TextBlock Grid.Row="2" x:Name="ImageName" Style="{StaticResource Sub}" Margin="0,10,0,0" Text="No image selected."/>
+        </Grid>
+
+        <!-- Settings -->
+        <Grid x:Name="PageSettings" Visibility="Collapsed">
+          <ScrollViewer VerticalScrollBarVisibility="Auto">
+            <StackPanel MaxWidth="760" HorizontalAlignment="Left">
+              <Border Style="{StaticResource Card}" Margin="0,0,0,14">
+                <StackPanel>
+                  <TextBlock Text="Appearance" FontWeight="SemiBold" FontSize="15"/>
+                  <TextBlock Style="{StaticResource Sub}" Text="Theme and accent changes apply immediately."/>
+                  <Grid Margin="0,14,0,0">
+                    <Grid.ColumnDefinitions><ColumnDefinition Width="180"/><ColumnDefinition Width="*"/></Grid.ColumnDefinitions>
+                    <TextBlock Text="Theme" VerticalAlignment="Center"/>
+                    <ComboBox x:Name="SetTheme" Grid.Column="1">
+                      <ComboBoxItem Content="Forge Purple"/>
+                      <ComboBoxItem Content="Midnight Black"/>
+                      <ComboBoxItem Content="Dark Gray"/>
+                    </ComboBox>
+                  </Grid>
+                  <Grid Margin="0,10,0,0">
+                    <Grid.ColumnDefinitions><ColumnDefinition Width="180"/><ColumnDefinition Width="*"/></Grid.ColumnDefinitions>
+                    <TextBlock Text="Accent colour" VerticalAlignment="Center"/>
+                    <ComboBox x:Name="SetAccent" Grid.Column="1" IsEditable="False">
+                      <ComboBoxItem Content="#8B5CF6"/>
+                      <ComboBoxItem Content="#A855F7"/>
+                      <ComboBoxItem Content="#6366F1"/>
+                      <ComboBoxItem Content="#7C3AED"/>
+                    </ComboBox>
+                  </Grid>
+                </StackPanel>
+              </Border>
+
+              <Border Style="{StaticResource Card}" Margin="0,0,0,14">
+                <StackPanel>
+                  <TextBlock Text="Behaviour" FontWeight="SemiBold" FontSize="15"/>
+                  <Grid Margin="0,14,0,0">
+                    <Grid.ColumnDefinitions><ColumnDefinition Width="180"/><ColumnDefinition Width="*"/></Grid.ColumnDefinitions>
+                    <TextBlock Text="Page on launch" VerticalAlignment="Center"/>
+                    <ComboBox x:Name="SetStartPage" Grid.Column="1">
+                      <ComboBoxItem Content="Dashboard"/>
+                      <ComboBoxItem Content="Tweaks"/>
+                      <ComboBoxItem Content="Power"/>
+                      <ComboBoxItem Content="Hardware"/>
+                      <ComboBoxItem Content="Restore"/>
+                    </ComboBox>
+                  </Grid>
+                  <CheckBox x:Name="SetWhatsNew" Content="Show What's New once after an update" Margin="0,12,0,0"/>
+                  <CheckBox x:Name="SetRemember" Content="Remember window size and position"/>
+                </StackPanel>
+              </Border>
+
+              <Border Style="{StaticResource Card}" Margin="0,0,0,14">
+                <StackPanel>
+                  <TextBlock Text="Local data" FontWeight="SemiBold" FontSize="15"/>
+                  <TextBlock Style="{StaticResource Sub}" Text="Backups, settings and release notes stay on this PC. Nothing is uploaded."/>
+                  <TextBox x:Name="SetFilePath" IsReadOnly="True" Margin="0,10,0,0" BorderThickness="0" Background="Transparent"/>
+                  <TextBlock Style="{StaticResource Sub}" Margin="0,12,0,0" TextWrapping="Wrap"
+                             Text="Not available in this build: online accounts, activation keys, edition entitlements and remote technician sessions. Safety confirmations cannot be turned off."/>
+                </StackPanel>
+              </Border>
+
+              <StackPanel Orientation="Horizontal">
+                <Button x:Name="BtnSaveSettings" Style="{StaticResource Primary}" Content="Save settings"/>
+                <Button x:Name="BtnResetSettings" Style="{StaticResource Btn}" Content="Reset to defaults" Margin="0"/>
+              </StackPanel>
+            </StackPanel>
+          </ScrollViewer>
+        </Grid>
+
+        <!-- What's New -->
+        <Grid x:Name="PageWhatsNew" Visibility="Collapsed">
+          <Border Style="{StaticResource Card}">
+            <TextBox x:Name="ChangelogBody" IsReadOnly="True" BorderThickness="0" Background="Transparent"
+                     FontFamily="Consolas" FontSize="12" TextWrapping="Wrap" VerticalScrollBarVisibility="Auto"/>
+          </Border>
+        </Grid>
+
+        <!-- About -->
+        <Grid x:Name="PageAbout" Visibility="Collapsed">
+          <ScrollViewer VerticalScrollBarVisibility="Auto">
+            <StackPanel MaxWidth="760" HorizontalAlignment="Left">
+              <Border Style="{StaticResource Card}" Margin="0,0,0,14">
+                <StackPanel>
+                  <TextBlock Text="FORGE TWEAKS" FontSize="22" FontWeight="Black" Foreground="White"/>
+                  <TextBlock Text="W I N D O W S   O P T I M I Z A T I O N" FontSize="10" Foreground="{StaticResource Accent}" Margin="0,2,0,10"/>
+                  <TextBlock x:Name="AboutVersion" Style="{StaticResource Sub}" Text="Version -"/>
+                  <TextBlock Style="{StaticResource Sub}" Margin="0,10,0,0" TextWrapping="Wrap"
+                             Text="A local Windows optimization tool. Every change is saved first, explained before it runs, and reversible from the Restore Center. No cloud connection is required."/>
+                </StackPanel>
+              </Border>
+              <Border Style="{StaticResource Card}" Margin="0,0,0,14">
+                <StackPanel>
+                  <TextBlock Text="What this build includes" FontWeight="SemiBold" FontSize="15"/>
+                  <TextBlock Style="{StaticResource Sub}" Margin="0,8,0,0" TextWrapping="Wrap"
+                             Text="Dashboard with live system information. A categorized, searchable tweak library with per-change confirmation, backup and restore. Windows power-plan switching and the ability to create Forge Tweaks plans from standard Windows templates. A read-only hardware report you can copy. Wallpaper customization with a saved original. Theme presets, accent colours and remembered window layout."/>
+                </StackPanel>
+              </Border>
+              <Border Style="{StaticResource Card}">
+                <StackPanel>
+                  <TextBlock Text="Known limitations" FontWeight="SemiBold" FontSize="15"/>
+                  <TextBlock Style="{StaticResource Sub}" Margin="0,8,0,0" TextWrapping="Wrap"
+                             Text="Single PowerShell script, not a signed or packaged application. No local account system, no activation keys or edition entitlements, and no remote technician sessions. Some changes need a sign-out or restart to take effect. System-level tweaks require administrator rights. Hardware values depend on what Windows reports and may be missing on some machines."/>
+                </StackPanel>
+              </Border>
+            </StackPanel>
+          </ScrollViewer>
+        </Grid>
+
+      </Grid>
+
+      <TextBlock Grid.Row="2" Style="{StaticResource Sub}" Margin="0,12,0,0" FontSize="11"
+                 Text="Nothing changes without a confirmation. Backups and settings live in %LOCALAPPDATA%\ForgeTune\Ember-Rebuild."/>
+    </Grid>
+  </Grid>
+</Window>
+'@
+
+    $reader = [Xml.XmlNodeReader]::new([xml]$xaml)
+    $window = [Windows.Markup.XamlReader]::Load($reader)
+    $script:FT.Window = $window
+
+    foreach ($name in @(
+        'Body','Nav','Status','PageTitle','PageSub','UserLabel','BtnAdmin',
+        'NavDashboard','NavTweaks','NavPower','NavHardware','NavRestore','NavActivity','NavWallpaper','NavSettings','NavWhatsNew','NavAbout',
+        'PageDashboard','PageTweaks','PagePower','PageHardware','PageRestore','PageActivity','PageWallpaper','PageSettings','PageWhatsNew','PageAbout',
+        'HomeOs','HomeCpu','HomeGpu','HomeRam','HomeMachine','HomePlan','HomeTweaks','HomeBackup','HomeAdmin','HomeVersion','HomeBackupState',
+        'BtnQuickScan','BtnQuickTweaks','BtnQuickHardware','BtnQuickRestore','BtnQuickWhatsNew',
+        'TweakCat','TweakFilter','BtnTweakAll','BtnTweakNone','BtnTweakRevert','BtnTweakApply','Tweaks','TweakSummary',
+        'BtnPlansRefresh','BtnPlanActivate','BtnPlanBalanced','BtnPlanPerf','Plans','PlanStatus',
+        'BtnHardware','BtnCopySummary','Snapshot',
+        'BtnBackupRefresh','BtnRestore','BackupRows','BackupInfo',
+        'BtnCopyLog','BtnClearLogView','Log',
+        'BtnChooseImage','BtnApplyWallpaper','Preview','ImageName',
+        'SetTheme','SetAccent','SetStartPage','SetWhatsNew','SetRemember','SetFilePath','BtnSaveSettings','BtnResetSettings',
+        'ChangelogBody','AboutVersion')) {
+        $el = $window.FindName($name)
+        if ($null -eq $el) { throw "UI element missing: $name" }
+        $script:FT.UI[$name] = $el
+    }
+
+    # ---------------------------------------------------------------- navigation
+    $script:Pages = [ordered]@{
+        Dashboard = @('Dashboard', 'An overview of this PC and your Forge Tweaks session.')
+        Tweaks    = @('Tweaks', 'Choose individual optimizations. Each one is explained, confirmed and reversible.')
+        Power     = @('Power Plans', 'Switch Windows power plans or create a Forge Tweaks plan from a standard template.')
+        Hardware  = @('Hardware', 'Read-only report of what Windows reports about this PC.')
+        Restore   = @('Restore Center', 'Every original value that was saved, and the option to put it back.')
+        Activity  = @('Activity', 'Everything that happened in this session, with severity levels.')
+        Wallpaper = @('Wallpaper', 'Preview and apply a static desktop wallpaper. The original is saved first.')
+        Settings  = @('Settings', 'Appearance, behaviour and local data options.')
+        WhatsNew  = @('What''s New', 'Release notes for this and previous versions.')
+        About     = @('About', 'What this build includes and what it does not.')
+    }
+
+    function Show-FTPage {
+        param([string]$Name)
+        if (-not $script:Pages.Contains($Name)) { $Name = 'Dashboard' }
+        foreach ($p in $script:Pages.Keys) {
+            $script:FT.UI["Page$p"].Visibility = if ($p -eq $Name) { 'Visible' } else { 'Collapsed' }
+            $script:FT.UI["Nav$p"].Tag = if ($p -eq $Name) { 'on' } else { '' }
+        }
+        $script:FT.UI.PageTitle.Text = $script:Pages[$Name][0]
+        $script:FT.UI.PageSub.Text   = $script:Pages[$Name][1]
+        if ($Name -eq 'WhatsNew') { Update-FTChangelogPage }
+        if ($Name -eq 'Settings') { Update-FTSettingsUI }
+        if ($Name -eq 'Dashboard') { Update-FTDashboard }
+    }
+
+    foreach ($p in $script:Pages.Keys) {
+        $btn = $script:FT.UI["Nav$p"]
+        $btn.Tag = ''
+        $btn.Add_Click([Windows.RoutedEventHandler]{ param($s, $e) Show-FTPage ([string]$s.Name).Substring(3) }.GetNewClosure())
+    }
+
+    # ---------------------------------------------------------------- wiring
+    $ui = $script:FT.UI
+    $ui.BtnAdmin.Add_Click({ Invoke-FT { Restart-FTAsAdmin } })
+    $ui.BtnQuickScan.Add_Click({ Invoke-FT { Read-FTDashboardSystem; Read-FTHardware } })
+    $ui.BtnQuickTweaks.Add_Click({ Show-FTPage 'Tweaks' })
+    $ui.BtnQuickHardware.Add_Click({ Invoke-FT { Read-FTHardware }; Show-FTPage 'Hardware' })
+    $ui.BtnQuickRestore.Add_Click({ Show-FTPage 'Restore' })
+    $ui.BtnQuickWhatsNew.Add_Click({ Show-FTWhatsNew -Force })
+
+    $ui.BtnTweakAll.Add_Click({ Select-FTTweaks $true })
+    $ui.BtnTweakNone.Add_Click({ Select-FTTweaks $false })
+    $ui.BtnTweakApply.Add_Click({ Invoke-FT { Apply-FTTweaks } })
+    $ui.BtnTweakRevert.Add_Click({ Invoke-FT { Revert-FTTweaks } })
+    $ui.TweakCat.Add_SelectionChanged({ if ($script:FT.UI.ContainsKey('Tweaks')) { try { Update-FTTweaks } catch {} } })
+    $ui.TweakFilter.Add_TextChanged({ try { Update-FTTweaks } catch {} })
+
+    $ui.BtnPlansRefresh.Add_Click({ Invoke-FT { Update-FTPlans } })
+    $ui.BtnPlanActivate.Add_Click({ Invoke-FT { Set-FTPlan } })
+    $ui.BtnPlanBalanced.Add_Click({ Invoke-FT { New-FTPlan 'Balanced' } })
+    $ui.BtnPlanPerf.Add_Click({ Invoke-FT { New-FTPlan 'Performance' } })
+
+    $ui.BtnHardware.Add_Click({ Invoke-FT { Read-FTHardware } })
+    $ui.BtnCopySummary.Add_Click({ Invoke-FT { Copy-FTSummary } })
+
+    $ui.BtnBackupRefresh.Add_Click({ Invoke-FT { Initialize-FTBackup } })
+    $ui.BtnRestore.Add_Click({ Invoke-FT { Restore-FT } })
+
+    $ui.BtnCopyLog.Add_Click({
+        if ($script:FT.UI.Log.Text) { [Windows.Clipboard]::SetText($script:FT.UI.Log.Text) }
+    })
+    $ui.BtnClearLogView.Add_Click({ $script:FT.UI.Log.Clear() })
+
+    $ui.BtnChooseImage.Add_Click({ Invoke-FT { Select-FTImage } })
+    $ui.BtnApplyWallpaper.Add_Click({ Invoke-FT { Set-FTWallpaper } })
+
+    $ui.BtnSaveSettings.Add_Click({ Invoke-FT { Save-FTSettingsFromUI } })
+    $ui.BtnResetSettings.Add_Click({ Invoke-FT { Reset-FTSettings } })
+    $ui.SetTheme.Add_SelectionChanged({ try { Update-FTSettingsUI } catch {} })
+
+    $ui.UserLabel.Text = if ($script:FT.IsAdmin) { 'Administrator' } else { 'Standard user' }
+    if ($script:FT.IsAdmin) { $ui.BtnAdmin.Visibility = 'Collapsed' }
+
+    # ---------------------------------------------------------------- lifecycle
+    function Restore-FTWindowBounds {
+        if (-not $script:FT.Settings.RememberWindow) { return }
+        if (-not $script:FT.Settings.WindowSaved) { return }
+        try {
+            $w = [double]$script:FT.Settings.WindowWidth
+            $h = [double]$script:FT.Settings.WindowHeight
+            $l = [double]$script:FT.Settings.WindowLeft
+            $t = [double]$script:FT.Settings.WindowTop
+            if ($w -lt $script:FT.Window.MinWidth)  { $w = $script:FT.Window.MinWidth }
+            if ($h -lt $script:FT.Window.MinHeight) { $h = $script:FT.Window.MinHeight }
+            if ($l -lt [Windows.SystemParameters]::VirtualScreenLeft) { $l = [Windows.SystemParameters]::VirtualScreenLeft }
+            if ($t -lt [Windows.SystemParameters]::VirtualScreenTop)  { $t = [Windows.SystemParameters]::VirtualScreenTop }
+            $script:FT.Window.WindowStartupLocation = 'Manual'
+            $script:FT.Window.Width  = $w
+            $script:FT.Window.Height = $h
+            $script:FT.Window.Left   = $l
+            $script:FT.Window.Top    = $t
+        }
+        catch { Write-FTLog "Window position could not be restored: $($_.Exception.Message)" 'WARN' }
+    }
+
+    function Save-FTWindowBounds {
+        if (-not $script:FT.Settings.RememberWindow) { return }
+        try {
+            if ($script:FT.Window.WindowState -eq [Windows.WindowState]::Normal) {
+                $script:FT.Settings.WindowWidth  = [double]$script:FT.Window.ActualWidth
+                $script:FT.Settings.WindowHeight = [double]$script:FT.Window.ActualHeight
+                $script:FT.Settings.WindowLeft   = [double]$script:FT.Window.Left
+                $script:FT.Settings.WindowTop    = [double]$script:FT.Window.Top
+                $script:FT.Settings.WindowSaved  = $true
+            }
+        }
+        catch { }
+        Save-FTSettings
+    }
+
+    $window.Add_Loaded({
+        Invoke-FT {
+            Initialize-FTSettings
+            Apply-FTTheme
+            Initialize-FTChangelog
+            Update-FTSettingsUI
+
+            Write-FTLog "$script:FTProduct v$script:FTVersion started. No settings have been changed."
+            Initialize-FTBackup
+            try { Update-FTPlans } catch { Write-FTLog "Power plans: $($_.Exception.Message)" 'WARN' }
+            Update-FTTweaks
+            Update-FTBackupDisplay
+            Read-FTDashboardSystem
+            Update-FTDashboard
+            Restore-FTWindowBounds
+
+            $start = [string]$script:FT.Settings.StartPage
+            Show-FTPage $start
+
+            Show-FTWhatsNew
+            Write-FTLog 'Ready. Select a page from the sidebar to begin.' 'OK'
+        }
+    })
+
+    $window.Add_Closing({
+        try { Save-FTWindowBounds } catch { }
+    })
+
+    [void]$window.ShowDialog()
+}
+catch {
+    $msg = "$script:FTProduct could not start:`r`n`r`n$($_.Exception.Message)`r`n`r`n$($_.ScriptStackTrace)"
+    try {
+        Add-Type -AssemblyName PresentationFramework
+        [void][Windows.MessageBox]::Show($msg, $script:FTProduct, 'OK', 'Error')
+    }
+    catch { Write-Host $msg }
+}
+# END OF FORGE TWEAKS
